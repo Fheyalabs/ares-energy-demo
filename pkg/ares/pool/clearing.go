@@ -73,6 +73,16 @@ func clearSlot(g GridSpec, supply, demand []float64, slot int) SlotResult {
 		return res
 	}
 
+	deriveAllocation(&res)
+	return res
+}
+
+// deriveAllocation fills Cleared and the two rationing ratios from
+// Supply, SupplyPrev and Demand, or resets the result to NoClearing when
+// the crossing turns out to be degenerate. Shared by the plaintext oracle
+// and by DecodeClearing, so the circuit and the oracle agree by
+// construction rather than by coincidence.
+func deriveAllocation(res *SlotResult) {
 	res.Cleared = res.Supply
 	if res.Demand < res.Cleared {
 		res.Cleared = res.Demand
@@ -87,7 +97,8 @@ func clearSlot(g GridSpec, supply, demand []float64, slot int) SlotResult {
 	// would make E[k*] negative), and D stays 0 for every later bucket —
 	// so no later bucket can trade either.
 	if res.Cleared <= 0 {
-		return SlotResult{Bucket: NoClearing}
+		*res = SlotResult{Bucket: NoClearing}
+		return
 	}
 
 	// Strictly cheaper sellers dispatch fully unless they alone oversupply.
@@ -108,5 +119,4 @@ func clearSlot(g GridSpec, supply, demand []float64, slot int) SlotResult {
 		}
 		res.MarginalRatio = ratio
 	}
-	return res
 }
