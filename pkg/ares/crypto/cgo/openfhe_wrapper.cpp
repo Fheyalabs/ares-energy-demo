@@ -1561,6 +1561,14 @@ CiphertextHandle EvalSum(CryptoContextHandle ctx, CiphertextHandle ct, int batch
         return nullptr;
     }
 }
+CiphertextHandle EvalAtIndex(CryptoContextHandle ctx, CiphertextHandle ct, int index) {
+    try {
+        auto* c = as_ctx(ctx);
+        return reinterpret_cast<CiphertextHandle>(new ARESCiphertext{c->cc->EvalAtIndex(as_ct(ct)->ct, index)});
+    } catch (...) {
+        return nullptr;
+    }
+}
 CiphertextHandle EvalMultConst(CryptoContextHandle ctx, CiphertextHandle ct, double scalar) {
     try {
         auto* c = as_ctx(ctx);

@@ -1217,6 +1217,50 @@ func EvalMultCKKSForContract(params ContractParams, evalMultKey, ctA, ctB []byte
 	return evalBinaryCKKS(params, evalMultKey, ctA, ctB, "EvalMult")
 }
 
+// EvalAtIndexCKKSForContract rotates a ciphertext along its slot axis.
+// A positive index shifts slot i+index into slot i; a negative index
+// shifts the other way. Rotation is level-free but consumes noise budget
+// and requires the joint rotation-key map (EvalKeyFinal.EvalSumFinal)
+// to contain a key for the requested index.
+func EvalAtIndexCKKSForContract(params ContractParams, evalSumKey, ct []byte, index int) ([]byte, error) {
+	if len(ct) == 0 {
+		return nil, fmt.Errorf("EvalAtIndex: ciphertext is required")
+	}
+	if len(evalSumKey) == 0 {
+		return nil, fmt.Errorf("EvalAtIndex: rotation key is required")
+	}
+	if index == 0 {
+		return nil, fmt.Errorf("EvalAtIndex: index must be non-zero")
+	}
+	cctx, err := createContractContext(params)
+	if err != nil {
+		return nil, err
+	}
+	defer C.FreeCryptoContext(cctx)
+
+	sumKey, err := deserializeRotKey(cctx, evalSumKey)
+	if err != nil {
+		return nil, err
+	}
+	defer C.FreeRotKey(sumKey)
+	if rc := C.InsertEvalSumKey(cctx, sumKey); rc != 0 {
+		return nil, fmt.Errorf("EvalAtIndex: insert rotation key failed")
+	}
+
+	in, err := deserializeCiphertext(cctx, ct)
+	if err != nil {
+		return nil, err
+	}
+	defer C.FreeCiphertext(in)
+
+	out := C.EvalAtIndex(cctx, in, C.int(index))
+	if out == nil {
+		return nil, fmt.Errorf("EvalAtIndex: rotation at index %d failed", index)
+	}
+	defer C.FreeCiphertext(out)
+	return serializeCiphertext(out)
+}
+
 // EvalConstMultCKKSForContract multiplies a ciphertext by a cleartext
 // scalar (does not consume a level).
 func EvalConstMultCKKSForContract(params ContractParams, ct []byte, scalar float64) ([]byte, error) {

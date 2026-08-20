@@ -198,6 +198,12 @@ CiphertextHandle EvalMultConst(CryptoContextHandle ctx,
 CiphertextHandle EvalSub(CryptoContextHandle ctx,
     CiphertextHandle a, CiphertextHandle b);
 
+// Rotate a ciphertext along its slot axis. A positive index shifts slot
+// i+index into slot i. The context must have a rotation key registered
+// for `index` (see InsertEvalSumKey). Returns nullptr on failure.
+CiphertextHandle EvalAtIndex(CryptoContextHandle ctx,
+    CiphertextHandle ct, int index);
+
 // Chebyshev sign approximation for argmax
 CiphertextHandle EvalChebyshevSign(CryptoContextHandle ctx,
     CiphertextHandle ct, int degree);
