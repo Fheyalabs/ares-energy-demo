@@ -105,3 +105,103 @@ func TestClearingCircuit_MinimumRunnableDepth(t *testing.T) {
 	}
 	t.Logf("MINIMUM RUNNABLE DEPTH = %d", first)
 }
+
+// step(E) must be non-decreasing along the price axis within each
+// delivery slot. If CKKS noise makes it dip, the one-hot picks up a
+// spurious second bump and the clearing bucket becomes ambiguous.
+// Spec §3.4 names this as the specific failure mode to test for.
+func TestComparator_MonotoneAlongPriceAxis(t *testing.T) {
+	g := testGrid()
+	// A deliberately shallow crossing: supply ramps in small steps so
+	// E[k] passes slowly through zero — the hardest case for monotonicity.
+	sup := mustEncode(t, EncodeSupply, g, []Offer{
+		{Slot: 0, PriceCt: 0.25, Quantity: 1},
+		{Slot: 0, PriceCt: 0.50, Quantity: 1},
+		{Slot: 0, PriceCt: 0.75, Quantity: 1},
+		{Slot: 0, PriceCt: 1.00, Quantity: 1},
+	})
+	dem := mustEncode(t, EncodeDemand, g, []Offer{{Slot: 0, PriceCt: 1.75, Quantity: 3}})
+
+	env := newTestEnv(t, 8192, PinnedDepth)
+	h := env.handle
+
+	ctS, err := h.Encrypt(sup)
+	if err != nil {
+		t.Fatalf("encrypt supply: %v", err)
+	}
+	ctD, err := h.Encrypt(dem)
+	if err != nil {
+		t.Fatalf("encrypt demand: %v", err)
+	}
+
+	excess, err := h.EvalSub(ctS, ctD)
+	if err != nil {
+		t.Fatalf("excess: %v", err)
+	}
+	coeffs := LogisticCoeffs(13, 4.0)
+	const scale = 8.0
+	scaled := make([]float64, len(coeffs))
+	inv := 1.0
+	for i, c := range coeffs {
+		scaled[i] = c * inv
+		inv /= scale
+	}
+	step, err := h.EvalPoly(excess, scaled)
+	if err != nil {
+		t.Fatalf("comparator: %v", err)
+	}
+
+	got := env.decrypt(t, step, g.Len())
+	// Allow a small noise dip; anything larger is a real inversion.
+	const slack = 0.02
+	for slot := 0; slot < g.NumSlots; slot++ {
+		for k := 1; k < g.NumBuckets; k++ {
+			prev := got[g.Index(slot, k-1)]
+			cur := got[g.Index(slot, k)]
+			if cur < prev-slack {
+				t.Errorf("slot %d bucket %d: step dipped %v -> %v (slack %v); "+
+					"comparator is non-monotone at depth %d",
+					slot, k, prev, cur, slack, PinnedDepth)
+			}
+		}
+	}
+}
+
+// A monotone odd comparator crosses 0.5 at E == 0 regardless of gain.
+// If this holds, comparator softness changes the ramp's steepness but
+// never displaces the clearing bucket (spec §3.5).
+func TestComparator_CrossingIndependentOfGain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the circuit three times; slow")
+	}
+	g := testGrid()
+	sup := mustEncode(t, EncodeSupply, g, []Offer{{Slot: 0, PriceCt: 0.75, Quantity: 4}})
+	dem := mustEncode(t, EncodeDemand, g, []Offer{{Slot: 0, PriceCt: 1.75, Quantity: 4}})
+	want, err := ClearPlaintext(g, sup, dem)
+	if err != nil {
+		t.Fatalf("oracle: %v", err)
+	}
+
+	env := newTestEnv(t, 8192, PinnedDepth)
+	h := env.handle
+	ctS, err := h.Encrypt(sup)
+	if err != nil {
+		t.Fatalf("encrypt supply: %v", err)
+	}
+	ctD, err := h.Encrypt(dem)
+	if err != nil {
+		t.Fatalf("encrypt demand: %v", err)
+	}
+
+	for _, gain := range []float64{2.0, 3.0, 4.0} {
+		out, err := EvalClearing(h, g, ClearingInputs{Supply: ctS, Demand: ctD},
+			LogisticCoeffs(13, gain), 8.0)
+		if err != nil {
+			t.Fatalf("gain %v: EvalClearing: %v", gain, err)
+		}
+		got := DecodeOneHot(g, env.decrypt(t, out.OneHot, g.Len()))
+		if got[0] != want[0].Bucket {
+			t.Errorf("gain %v: bucket %d, want %d", gain, got[0], want[0].Bucket)
+		}
+	}
+}

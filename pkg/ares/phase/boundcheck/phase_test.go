@@ -40,6 +40,18 @@ func (h *fakeContextHandle) EvalProductSum(ctLeft, ctRight []byte, nSlots int) (
 	return h.cannedCT, nil
 }
 
+// The bound-check phase uses none of the following, but ContextHandle
+// carries them for circuits that aggregate, compare and rotate.
+func (h *fakeContextHandle) EvalAdd(ctA, ctB []byte) ([]byte, error) { return h.cannedCT, nil }
+func (h *fakeContextHandle) EvalSub(ctA, ctB []byte) ([]byte, error) { return h.cannedCT, nil }
+func (h *fakeContextHandle) EvalPoly(ct []byte, coeffs []float64) ([]byte, error) {
+	return h.cannedCT, nil
+}
+func (h *fakeContextHandle) EvalAtIndex(ct []byte, index int) ([]byte, error) {
+	return h.cannedCT, nil
+}
+func (h *fakeContextHandle) Encrypt(vals []float64) ([]byte, error) { return h.cannedCT, nil }
+
 // captureHandler records every OnViolation call for assertions.
 type captureHandler struct {
 	calls []violationCall

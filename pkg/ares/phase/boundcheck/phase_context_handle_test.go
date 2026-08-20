@@ -19,9 +19,17 @@ type fakeHandle struct{}
 func (fakeHandle) Params() helperclient.ContractParams {
 	return helperclient.ContractParams{RingDim: 1024, Depth: 2}
 }
-func (fakeHandle) EvalMult(a, b []byte) ([]byte, error)          { return []byte("chk"), nil }
+func (fakeHandle) EvalMult(a, b []byte) ([]byte, error)                { return []byte("chk"), nil }
 func (fakeHandle) EvalSubConst(ct []byte, v []float64) ([]byte, error) { return ct, nil }
 func (fakeHandle) EvalProductSum(a, b []byte, n int) ([]byte, error)   { return []byte("chk"), nil }
+
+// The bound-check phase uses none of the following, but ContextHandle
+// carries them for circuits that aggregate, compare and rotate.
+func (fakeHandle) EvalAdd(a, b []byte) ([]byte, error)              { return []byte("chk"), nil }
+func (fakeHandle) EvalSub(a, b []byte) ([]byte, error)              { return []byte("chk"), nil }
+func (fakeHandle) EvalPoly(ct []byte, c []float64) ([]byte, error)  { return ct, nil }
+func (fakeHandle) EvalAtIndex(ct []byte, index int) ([]byte, error) { return ct, nil }
+func (fakeHandle) Encrypt(v []float64) ([]byte, error)              { return []byte("enc"), nil }
 
 func TestPhase_UsesPerSessionHandleFromContext(t *testing.T) {
 	// Construction WITHOUT a handle (stub-constructed using NewPhase), but
