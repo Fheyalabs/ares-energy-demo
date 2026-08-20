@@ -111,6 +111,24 @@ func EncodeDemand(g GridSpec, offers []Offer) ([]float64, error) {
 	return out, nil
 }
 
+// SlotBoundaryMask returns a plaintext vector that is 0 at every
+// delivery slot's first price bucket and 1 everywhere else.
+//
+// A slot rotation along the packed price axis crosses delivery-slot
+// boundaries, so the circuit multiplies the rotated curve by this mask to
+// stop each slot's bucket 0 from inheriting the previous slot's last
+// bucket.
+func SlotBoundaryMask(g GridSpec) []float64 {
+	out := make([]float64, g.Len())
+	for i := range out {
+		out[i] = 1
+	}
+	for slot := 0; slot < g.NumSlots; slot++ {
+		out[g.Index(slot, 0)] = 0
+	}
+	return out
+}
+
 // PaddingValue returns the ARES-BC normalising coordinate z such that
 // ||vec||^2 + z^2 == c.
 //

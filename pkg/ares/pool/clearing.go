@@ -55,7 +55,11 @@ func ClearPlaintext(g GridSpec, supply, demand []float64) ([]SlotResult, error) 
 
 func clearSlot(g GridSpec, supply, demand []float64, slot int) SlotResult {
 	res := SlotResult{Bucket: NoClearing}
-	for k := 0; k < g.NumBuckets; k++ {
+	// Bucket 0 is a guard, never a valid clearing price. It has no
+	// predecessor to difference against in the homomorphic circuit, so the
+	// circuit masks it; the oracle skips it for the same reason, keeping
+	// the two in agreement by construction. See EvalClearing stage 6.
+	for k := 1; k < g.NumBuckets; k++ {
 		i := g.Index(slot, k)
 		if supply[i]-demand[i] < 0 {
 			continue

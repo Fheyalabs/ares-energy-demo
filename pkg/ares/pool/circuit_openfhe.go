@@ -133,10 +133,32 @@ func EvalClearing(
 		return out, fmt.Errorf("pool: price-axis shift: %w", err)
 	}
 
-	// Stage 6: the crossing is where the step turns on.
-	oneHot, err := h.EvalSub(step, prev)
+	// Stage 6: the crossing is where the step turns on, masked at each
+	// delivery slot's first price bucket.
+	//
+	// The mask does two jobs. The rotation runs over the whole ciphertext,
+	// so bucket 0 of each slot would otherwise inherit the *previous*
+	// slot's last bucket (slot 0 wrapping from the end). And bucket 0 has
+	// no predecessor to difference against at all: leaving it as step[0]
+	// makes it a false crossing whenever the comparator has not saturated
+	// by the bottom of the grid, which readily outbids the true crossing.
+	//
+	// So bucket 0 is a guard: never a valid clearing price. This is
+	// economically benign — the grid is floored at price 0 precisely
+	// because clearing at or below zero is meaningless (sellers curtail
+	// rather than pay to inject) — but it does mean the usable price range
+	// is buckets 1..K-1.
+	diff, err := h.EvalSub(step, prev)
 	if err != nil {
 		return out, fmt.Errorf("pool: one-hot: %w", err)
+	}
+	ctMask, err := h.Encrypt(SlotBoundaryMask(g))
+	if err != nil {
+		return out, fmt.Errorf("pool: encrypt boundary mask: %w", err)
+	}
+	oneHot, err := h.EvalMult(diff, ctMask)
+	if err != nil {
+		return out, fmt.Errorf("pool: apply boundary mask: %w", err)
 	}
 	out.OneHot = oneHot
 
@@ -231,4 +253,92 @@ func DecodeClearing(g GridSpec, oneHot, supplyAt, supplyPrevAt, demandAt []float
 		out[slot] = res
 	}
 	return out
+}
+
+// PinnedDepth is the measured minimum multiplicative depth of the
+// clearing circuit, established by TestCalibrate_ClearingCircuitDepth
+// (ring 32768, ScalingModSize 50, degree-13 comparator): worst-slot
+// absolute error 1.75e-4 against a 0.35 tolerance.
+//
+// This is a measurement, not the design estimate — the spec's ledger
+// projected 7. Depth 5 is also the lowest depth at which the circuit
+// runs at all (TestClearingCircuit_MinimumRunnableDepth), so accuracy is
+// not the binding constraint here; the level count is.
+const PinnedDepth uint32 = 5
+
+// ClearingCircuit adapts EvalClearing to fhecalib.CircuitUnderTest so
+// the depth sweep can measure the circuit instead of guessing at it.
+//
+// The calibrated output is the one-hot vector: it is the only output
+// whose accuracy determines the clearing decision, and its plaintext
+// ground truth is a clean indicator, which makes the abs-error tolerance
+// meaningful.
+type ClearingCircuit struct {
+	Grid   GridSpec
+	Supply []float64
+	Demand []float64
+	Coeffs []float64
+	Scale  float64
+}
+
+func (ClearingCircuit) Name() string { return "pool-uniform-price-clearing" }
+
+func (c ClearingCircuit) Inputs() [][]float64 {
+	return [][]float64{c.Supply, c.Demand}
+}
+
+// Expected evaluates the same formula the circuit does, in plaintext.
+//
+// It deliberately mirrors EvalClearing stage for stage rather than
+// returning an idealised 0/1 indicator. The calibrator's job is to find
+// the depth at which FHE approximation error falls below tolerance, so
+// the ground truth must isolate *that* error — comparing against an
+// idealised indicator would instead measure how far the comparator
+// polynomial sits from a true step, which no amount of depth can fix.
+//
+// Note the bump height is not 1: at the crossing E is at or just above 0,
+// so the comparator returns ~0.5 and the bump is
+// p(E[k*]/scale) - p(E[k*-1]/scale).
+func (c ClearingCircuit) Expected(inputs [][]float64) []float64 {
+	g := c.Grid
+	step := make([]float64, g.Len())
+	for i := range step {
+		step[i] = evalPolyAt(c.Coeffs, (inputs[0][i]-inputs[1][i])/c.Scale)
+	}
+	mask := SlotBoundaryMask(g)
+	out := make([]float64, g.Len())
+	for slot := 0; slot < g.NumSlots; slot++ {
+		for k := 0; k < g.NumBuckets; k++ {
+			idx := g.Index(slot, k)
+			prev := 0.0
+			if k > 0 {
+				prev = step[idx-1]
+			}
+			out[idx] = (step[idx] - prev) * mask[idx]
+		}
+	}
+	return out
+}
+
+func (c ClearingCircuit) Eval(h fhecalib.ContextHandle, encInputs [][]byte) ([]byte, error) {
+	if len(encInputs) != 2 {
+		return nil, fmt.Errorf("pool: want 2 encrypted inputs, got %d", len(encInputs))
+	}
+	out, err := EvalClearing(h, c.Grid, ClearingInputs{
+		Supply: encInputs[0],
+		Demand: encInputs[1],
+	}, c.Coeffs, c.Scale)
+	if err != nil {
+		return nil, err
+	}
+	return out.OneHot, nil
+}
+
+// evalPolyAt evaluates an ascending-order coefficient list by Horner.
+func evalPolyAt(coeffs []float64, x float64) float64 {
+	acc := 0.0
+	for i := len(coeffs) - 1; i >= 0; i-- {
+		acc = acc*x + coeffs[i]
+	}
+	return acc
 }
