@@ -67,6 +67,26 @@ func (h *cgoHandle) EvalProductSum(ctLeft, ctRight []byte, nSlots int) ([]byte, 
 	return cgo.EvalProductSumForContract(h.cgoParams, h.evalKeys, ctLeft, ctRight, nSlots)
 }
 
+func (h *cgoHandle) EvalAdd(ctA, ctB []byte) ([]byte, error) {
+	return cgo.EvalAddCKKSForContract(h.cgoParams, ctA, ctB)
+}
+
+func (h *cgoHandle) EvalSub(ctA, ctB []byte) ([]byte, error) {
+	return cgo.EvalSubCKKSForContract(h.cgoParams, ctA, ctB)
+}
+
+func (h *cgoHandle) EvalPoly(ct []byte, coeffs []float64) ([]byte, error) {
+	return cgo.EvalPolyCKKSForContract(h.cgoParams, h.evalKeys.EvalMultFinal, ct, coeffs)
+}
+
+func (h *cgoHandle) EvalAtIndex(ct []byte, index int) ([]byte, error) {
+	return cgo.EvalAtIndexCKKSForContract(h.cgoParams, h.evalKeys.EvalSumFinal, ct, index)
+}
+
+func (h *cgoHandle) Encrypt(vals []float64) ([]byte, error) {
+	return cgo.EncryptCKKSForContract(h.cgoParams, h.jointPK, vals)
+}
+
 // NewContextHandle returns a ContextHandle backed by the in-process OpenFHE
 // bridge. This is the real-mode constructor for Phase-1c (bound-check) and
 // any other phase that drives homomorphic ops via a ContextHandle.

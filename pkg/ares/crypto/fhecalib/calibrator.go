@@ -28,6 +28,19 @@ type ContextHandle interface {
 	// EvalProductSum computes EvalSum(EvalMult(left,right)) over nSlots (the
 	// squared magnitude when left == right).
 	EvalProductSum(ctLeft, ctRight []byte, nSlots int) ([]byte, error)
+	// EvalAdd adds two ciphertexts slot-wise. Level-free.
+	EvalAdd(ctA, ctB []byte) ([]byte, error)
+	// EvalSub subtracts ctB from ctA slot-wise. Level-free.
+	EvalSub(ctA, ctB []byte) ([]byte, error)
+	// EvalPoly applies p(x) = sum(coeffs[i] * x^i) slot-wise. coeffs is
+	// in ascending order. Consumes ceil(log2(deg)) + 1 levels.
+	EvalPoly(ct []byte, coeffs []float64) ([]byte, error)
+	// EvalAtIndex rotates a ciphertext along its slot axis. A positive
+	// index shifts slot i+index into slot i. Level-free.
+	EvalAtIndex(ct []byte, index int) ([]byte, error)
+	// Encrypt encrypts a public plaintext vector under the joint key.
+	// Used for public constants a circuit adds into an aggregate.
+	Encrypt(vals []float64) ([]byte, error)
 }
 
 // CircuitUnderTest describes one homomorphic computation to calibrate.
