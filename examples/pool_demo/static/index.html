@@ -222,41 +222,64 @@ const pad=(v,w)=>{ let s=v.toFixed(2); while(s.replace('.','').replace('-','').l
    against a WASM build of OpenFHE 1.5.1 — the same code the Go bridge
    and the mobile ports use, not a reimplementation. */
 const Crypto = {
-  mode:'loading', M:null, session:null, version:'',
-  // Ring 16384 is the smallest OpenFHE accepts as 128-bit secure here; it
-  // refuses 8192 outright rather than quietly weakening.
-  RING:16384, DEPTH:7, SCALE_MOD:50, FIRST_MOD:60, BATCH:64,
+  mode:'loading', M:null, session:null, version:'', error:'',
+  // Ring 32768 is not a comfort margin: OpenFHE REFUSES ring 16384 for a
+  // depth-7 chain ("does not comply with HE standards recommendation") and
+  // refuses 8192 outright. Depth 7 is the calibrated PinnedDepth, so 32768
+  // is the smallest ring that can actually carry this circuit at 128-bit
+  // security — and it is the spec's production ring.
+  RING:32768, DEPTH:7, SCALE_MOD:50, FIRST_MOD:60, BATCH:64,
 
-  async init(){
+  // Decode a C++ exception into something readable.
+  why(e){
+    try{ return this.M && this.M.getExceptionMessage
+      ? this.M.getExceptionMessage(e).filter(Boolean).join(': ') : String(e); }
+    catch(_){ return String(e); }
+  },
+
+  async init(onStep){
     try{
+      onStep && onStep('FETCHING MODULE');
       await new Promise((res,rej)=>{
         const s=document.createElement('script');
-        s.src='/wasm/pool_wasm.js'; s.onload=res; s.onerror=()=>rej(new Error('no wasm'));
+        s.src='/wasm/pool_wasm.js'; s.onload=res;
+        s.onerror=()=>rej(new Error('could not fetch /wasm/pool_wasm.js'));
         document.head.appendChild(s);
       });
+      onStep && onStep('INSTANTIATING 2.7MB WASM');
       this.M = await PoolWasm();
       this.version = this.M.openfheVersion();
+      onStep && onStep('BUILDING CKKS CONTEXT');
       const t=performance.now();
       this.session = new this.M.Session(this.RING,this.DEPTH,this.SCALE_MOD,this.FIRST_MOD,this.BATCH);
       this.ctxMs = Math.round(performance.now()-t);
       this.mode='wasm';
       return true;
-    }catch(e){ this.mode='server'; console.warn('wasm unavailable:',e); return false; }
+    }catch(e){
+      this.mode='failed';
+      this.error=this.why(e);
+      console.error('pool_wasm init failed:', this.error, e);
+      return false;
+    }
   },
 
   // Self-test: prove in-tab FHE actually works before claiming it does.
   selfTest(){
-    const a=this.session;
-    const t=performance.now();
-    const pk=a.keyGenFirst();
-    const ct=a.encrypt(pk,[1,2,3,4]);
-    const ct2=a.evalMultConst(ct,2.0);
-    const got=a.fuse([a.partialDecrypt(ct2)],4);
-    const ms=Math.round(performance.now()-t);
-    // Single-share fuse is only valid because this test used a one-party
-    // chain; a real pool needs every share.
-    const ok=Math.abs(got[0]-2)<1e-6 && Math.abs(got[3]-8)<1e-6;
-    return {ok, ms, pk:pk.length, ct:ct.length};
+    try{
+      const a=this.session;
+      const t=performance.now();
+      const pk=a.keyGenFirst();
+      const ct=a.encrypt(pk,[1,2,3,4]);
+      const ct2=a.evalMultConst(ct,2.0);
+      const got=a.fuse([a.partialDecrypt(ct2)],4);
+      const ms=Math.round(performance.now()-t);
+      // A single-share fuse is only valid because this test used a
+      // one-party chain; a real pool needs every share.
+      const ok=Math.abs(got[0]-2)<1e-6 && Math.abs(got[3]-8)<1e-6;
+      return {ok, ms, pk:pk.length, ct:ct.length};
+    }catch(e){
+      return {ok:false, err:this.why(e)};
+    }
   }
 };
 
@@ -352,16 +375,30 @@ function render(){
 
 paint($('main'),'00.00');
 ladder(null);
-$('capNote').textContent='LOADING OPENFHE WASM …';
-Crypto.init().then(ok=>{
-  if(ok){
-    const t=Crypto.selfTest();
-    $('capNote').textContent = t.ok
-      ? `IN-TAB FHE LIVE · CTX ${Crypto.ctxMs}MS · KEYGEN+ENC+EVAL+DEC ${t.ms}MS · PK ${(t.pk/1024|0)}KB`
-      : 'WASM LOADED BUT SELF-TEST FAILED';
-    if(!t.ok) Crypto.mode='server';
+const cap = s => { $('capNote').textContent = s; };
+cap('LOADING OPENFHE WASM …');
+
+Crypto.init(step => cap(step + ' …')).then(ok => {
+  if(!ok){
+    // Never leave the caption stuck on a progress message: a silent
+    // failure here is indistinguishable from a slow load.
+    cap('WASM FAILED — ' + (Crypto.error || 'unknown').slice(0,120).toUpperCase());
+    render();
+    return;
   }
-  render();
+  cap('RUNNING IN-TAB SELF-TEST …');
+  // Yield first so the caption actually paints; the self-test blocks the
+  // main thread for a second or so at ring 32768.
+  setTimeout(()=>{
+    const t = Crypto.selfTest();
+    if(t.ok){
+      cap(`IN-TAB FHE LIVE · CTX ${Crypto.ctxMs}MS · KEYGEN+ENC+EVAL+DEC ${t.ms}MS · PK ${(t.pk/1024|0)}KB`);
+    }else{
+      Crypto.mode='failed';
+      cap('SELF-TEST FAILED — ' + (t.err || '').slice(0,120).toUpperCase());
+    }
+    render();
+  }, 30);
 });
 </script>
 </body>
