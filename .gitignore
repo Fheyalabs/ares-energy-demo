@@ -41,3 +41,6 @@ venv/
 .env.*
 !.env.example
 clients/rideshareswift/.build/
+
+# pool_demo WASM build artifacts (2.7 MB); rebuild with examples/pool_demo/wasm/build.sh
+examples/pool_demo/static/wasm/

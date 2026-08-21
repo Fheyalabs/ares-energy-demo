@@ -216,13 +216,48 @@ function paint(el, str){
 }
 const pad=(v,w)=>{ let s=v.toFixed(2); while(s.replace('.','').replace('-','').length<w) s='0'+s; return s; };
 
-/* ---------- crypto seam ----------
-   Replaced by the WASM module once OpenFHE is built for the browser.
-   Until then the server holds this seam; the annunciator says SIM. */
+/* ---------- crypto: OpenFHE compiled to WebAssembly ----------
+   This runs inside the tab. The module is ARES-core's own C wrapper
+   (pkg/ares/crypto/cgo/openfhe_wrapper.cpp) compiled by emscripten
+   against a WASM build of OpenFHE 1.5.1 — the same code the Go bridge
+   and the mobile ports use, not a reimplementation. */
 const Crypto = {
-  mode: 'server',
-  ready: false,
-  async init(){ /* wasm loader lands here */ return false; }
+  mode:'loading', M:null, session:null, version:'',
+  // Ring 16384 is the smallest OpenFHE accepts as 128-bit secure here; it
+  // refuses 8192 outright rather than quietly weakening.
+  RING:16384, DEPTH:7, SCALE_MOD:50, FIRST_MOD:60, BATCH:64,
+
+  async init(){
+    try{
+      await new Promise((res,rej)=>{
+        const s=document.createElement('script');
+        s.src='/wasm/pool_wasm.js'; s.onload=res; s.onerror=()=>rej(new Error('no wasm'));
+        document.head.appendChild(s);
+      });
+      this.M = await PoolWasm();
+      this.version = this.M.openfheVersion();
+      const t=performance.now();
+      this.session = new this.M.Session(this.RING,this.DEPTH,this.SCALE_MOD,this.FIRST_MOD,this.BATCH);
+      this.ctxMs = Math.round(performance.now()-t);
+      this.mode='wasm';
+      return true;
+    }catch(e){ this.mode='server'; console.warn('wasm unavailable:',e); return false; }
+  },
+
+  // Self-test: prove in-tab FHE actually works before claiming it does.
+  selfTest(){
+    const a=this.session;
+    const t=performance.now();
+    const pk=a.keyGenFirst();
+    const ct=a.encrypt(pk,[1,2,3,4]);
+    const ct2=a.evalMultConst(ct,2.0);
+    const got=a.fuse([a.partialDecrypt(ct2)],4);
+    const ms=Math.round(performance.now()-t);
+    // Single-share fuse is only valid because this test used a one-party
+    // chain; a real pool needs every share.
+    const ok=Math.abs(got[0]-2)<1e-6 && Math.abs(got[3]-8)<1e-6;
+    return {ok, ms, pk:pk.length, ct:ct.length};
+  }
 };
 
 /* ---------- state ---------- */
@@ -312,16 +347,22 @@ function render(){
     ? (o.did_clear ? 'CLEARED '+o.cleared_px.toFixed(2) : (o.note||'').toUpperCase())
     : 'PRICE LADDER';
 
-  $('capNote').textContent = Crypto.mode==='wasm'
-    ? 'ENCRYPTED IN THIS TAB · WASM'
-    : 'REAL DE-LU DAY-AHEAD 2024-05-12 · SIM = ENCRYPTION NOT YET IN-TAB';
-
   ladder(o);
 }
 
 paint($('main'),'00.00');
 ladder(null);
-Crypto.init().then(ok=>{ if(ok) Crypto.mode='wasm'; render(); });
+$('capNote').textContent='LOADING OPENFHE WASM …';
+Crypto.init().then(ok=>{
+  if(ok){
+    const t=Crypto.selfTest();
+    $('capNote').textContent = t.ok
+      ? `IN-TAB FHE LIVE · CTX ${Crypto.ctxMs}MS · KEYGEN+ENC+EVAL+DEC ${t.ms}MS · PK ${(t.pk/1024|0)}KB`
+      : 'WASM LOADED BUT SELF-TEST FAILED';
+    if(!t.ok) Crypto.mode='server';
+  }
+  render();
+});
 </script>
 </body>
 </html>
