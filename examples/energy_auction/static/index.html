@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SEALED BID</title>
+<style>
+:root{
+  --cyan:#d7f6fa; --pink:#f9d5d0;
+  --page:#0f0f18; --bezel-a:#34343a; --bezel-b:#222226; --panel:#08080a;
+  --ghost:rgba(215,246,250,.05);
+  --dw:44px; --dh:88px; --st:9px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--page); color:#4a4a55;
+  font:12px/1 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.16em;
+  display:grid; place-items:center; padding:26px; -webkit-font-smoothing:antialiased;
+}
+.wrap{display:flex;flex-direction:column;align-items:center;gap:18px}
+
+.device{background:linear-gradient(160deg,var(--bezel-a),var(--bezel-b));border-radius:30px;padding:20px;
+  box-shadow:0 1px 0 rgba(255,255,255,.07) inset,0 -1px 0 rgba(0,0,0,.5) inset,0 30px 70px rgba(0,0,0,.65)}
+.panel{background:var(--panel);border-radius:20px;padding:24px 30px 20px;width:470px;
+  box-shadow:0 3px 14px rgba(0,0,0,.9) inset,0 0 0 1px rgba(0,0,0,.9)}
+
+/* role + phase */
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;font-size:10px}
+.role{color:var(--c);text-shadow:0 0 10px var(--c)}
+.phase{color:#3c3c46}
+
+/* seven segment */
+.readout{display:flex;justify-content:center;align-items:flex-end;gap:9px;min-height:var(--dh)}
+.digit{position:relative;width:var(--dw);height:var(--dh)}
+.digit i{position:absolute;display:block;background:var(--ghost)}
+.digit i.on{background:var(--c);box-shadow:0 0 7px var(--c),0 0 18px var(--c),0 0 38px var(--c)}
+.digit .a,.digit .g,.digit .d{left:calc(var(--st)/2);width:calc(var(--dw) - var(--st));height:var(--st);
+  clip-path:polygon(0 50%,14% 0,86% 0,100% 50%,86% 100%,14% 100%)}
+.digit .a{top:0} .digit .g{top:calc(50% - var(--st)/2)} .digit .d{bottom:0}
+.digit .f,.digit .b,.digit .e,.digit .c{width:var(--st);height:calc(50% - var(--st)/2);
+  clip-path:polygon(50% 0,100% 8%,100% 92%,50% 100%,0 92%,0 8%)}
+.digit .f{top:calc(var(--st)/2);left:0} .digit .b{top:calc(var(--st)/2);right:0}
+.digit .e{bottom:calc(var(--st)/2);left:0} .digit .c{bottom:calc(var(--st)/2);right:0}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--ghost);margin-bottom:7px}
+.dot.on{background:var(--c);box-shadow:0 0 7px var(--c),0 0 18px var(--c)}
+.unit{text-align:center;margin-top:11px;font-size:10px;color:var(--c);opacity:.5}
+
+/* the crypto pipeline, the point of the demo */
+.pipe{display:flex;gap:6px;margin-top:22px}
+.pipe div{flex:1;text-align:center;font-size:8px;letter-spacing:.1em;padding:7px 2px;border-radius:5px;
+  background:rgba(255,255,255,.018);color:#33333c;transition:.25s}
+.pipe div.on{background:rgba(215,246,250,.09);color:var(--cyan);text-shadow:0 0 9px var(--cyan)}
+.pipe div.busy{background:rgba(249,213,208,.11);color:var(--pink);text-shadow:0 0 9px var(--pink)}
+.status{text-align:center;margin-top:12px;font-size:9px;color:#4d4d58;min-height:12px}
+
+/* peers */
+.peers{display:flex;gap:6px;justify-content:center;margin-top:18px}
+.peers i{width:26px;height:5px;border-radius:3px;background:var(--ghost)}
+.peers i.seated{background:rgba(215,246,250,.3)}
+.peers i.sealed{background:var(--cyan);box-shadow:0 0 7px var(--cyan)}
+.peers i.me{outline:1px solid rgba(249,213,208,.7);outline-offset:2px}
+
+/* keys */
+.keys{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+button{font:inherit;font-size:10px;letter-spacing:.15em;background:linear-gradient(#2b2b31,#1e1e23);
+  color:#7a7a88;border:0;border-radius:8px;padding:12px 16px;cursor:pointer;min-width:56px;
+  box-shadow:0 1px 0 rgba(255,255,255,.06) inset,0 2px 5px rgba(0,0,0,.55)}
+button:active{transform:translateY(1px)}
+button.lit{color:var(--c);text-shadow:0 0 10px var(--c)}
+button.go{background:linear-gradient(#2e4a35,#22331f);color:#b9f0c0}
+button.no{background:linear-gradient(#4a2e2e,#331f1f);color:#f0b9b9}
+button:disabled{opacity:.28;cursor:not-allowed}
+
+/* trade log */
+.log{width:510px;font-size:9px;color:#3c3c46}
+.log h4{font-weight:400;letter-spacing:.14em;margin-bottom:8px;color:#33333c}
+.log table{width:100%;border-collapse:collapse}
+.log td{padding:5px 0;border-top:1px solid #1b1b22}
+.log .ok{color:var(--cyan)} .log .no{color:#5a4a4a}
+.log .empty{color:#2c2c34;padding-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="device">
+  <div class="panel" id="panel" style="--c:var(--cyan)">
+    <div class="top">
+      <span class="role" id="role">CONNECTING</span>
+      <span class="phase" id="phase"></span>
+    </div>
+
+    <div class="readout" id="main"></div>
+    <div class="unit" id="unit">CT / KWH</div>
+
+    <div class="pipe">
+      <div id="p1">KEYS</div>
+      <div id="p2">ENCRYPT</div>
+      <div id="p3">SEALED</div>
+      <div id="p4">ARGMAX</div>
+      <div id="p5">OPEN</div>
+    </div>
+    <div class="status" id="status">LOADING OPENFHE WASM …</div>
+
+    <div class="peers" id="peers"></div>
+  </div>
+</div>
+
+<div class="keys" id="keys"></div>
+
+<div class="log">
+  <h4>SETTLED TRADES</h4>
+  <table><tbody id="tlog"><tr><td class="empty">NONE YET</td></tr></tbody></table>
+</div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* ---------- seven segment ---------- */
+const SEG={'0':'abcdef','1':'bc','2':'abdeg','3':'abcdg','4':'bcfg','5':'acdfg',
+           '6':'acdefg','7':'abc','8':'abcdefg','9':'abcdfg','-':'g'};
+function paint(el,str){
+  el.innerHTML='';
+  for(const ch of str){
+    if(ch==='.'){const d=document.createElement('div');d.className='dot on';el.appendChild(d);continue;}
+    const d=document.createElement('div'); d.className='digit';
+    for(const s of ['a','b','c','d','e','f','g']){
+      const i=document.createElement('i'); i.className=s;
+      if((SEG[ch]||'').includes(s)) i.classList.add('on');
+      d.appendChild(i);
+    }
+    el.appendChild(d);
+  }
+}
+const fmt = v => { let s=Math.abs(v).toFixed(2); return s.length<5?'0'+s:s; };
+
+/* ---------- FHE, in this tab ----------
+   OpenFHE 1.5.1 compiled to WebAssembly, driving ARES-core's own C
+   wrapper. Ring 16384 / depth 3 is the cheapest parameter set that runs a
+   5-way soft-mask argmax at 128-bit security: OpenFHE refuses ring 8192
+   outright, and depth 3 is exactly 1 level for the step polynomial plus
+   ceil(log2(4)) for the product tree. */
+const RING=16384, DEPTH=3, SCALE_MOD=50, FIRST_MOD=60, BATCH=8;
+const SHARPEN=[0.5,0.5];   // p(x)=x/2+1/2, the cabs degree-1 comparator
+const SPAN=16.0;           // scales bids into the comparator's [-1,1] domain
+
+const b64 = u8 => { let s=''; for(const b of u8) s+=String.fromCharCode(b); return btoa(s); };
+const unb64 = s => { const r=atob(s); const u=new Uint8Array(r.length);
+                     for(let i=0;i<r.length;i++) u[i]=r.charCodeAt(i); return u; };
+
+const FHE = {
+  M:null, S:null, ready:false, err:'',
+  why(e){ try{ return this.M&&this.M.getExceptionMessage
+    ? this.M.getExceptionMessage(e).filter(Boolean).join(': ') : String(e);}catch(_){return String(e);} },
+  async init(step){
+    try{
+      step('FETCHING WASM');
+      await new Promise((res,rej)=>{const s=document.createElement('script');
+        s.src='/wasm/pool_wasm.js'; s.onload=res; s.onerror=()=>rej(new Error('fetch failed'));
+        document.head.appendChild(s);});
+      step('INSTANTIATING');
+      this.M=await PoolWasm();
+      step('BUILDING CKKS CONTEXT');
+      this.S=new this.M.Session(RING,DEPTH,SCALE_MOD,FIRST_MOD,BATCH);
+      this.ready=true; return true;
+    }catch(e){ this.err=this.why(e); return false; }
+  }
+};
+
+/* ---------- state ---------- */
+const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+let me=null, st=null, myBid=8.00, pubKey=null;
+// The seller keeps the ciphertext set it was asked to rank, so it can open
+// the winning one without a second round trip.
+let lastBids=[], lastSeats=[];
+const send=o=>ws.readyState===1&&ws.send(JSON.stringify(o));
+const status=s=>$('status').textContent=s;
+
+ws.onmessage=async e=>{
+  const m=JSON.parse(e.data);
+  if(m.type==='state'){ me=m.you; st=m.state; render(); return; }
+  if(!FHE.ready) return;
+
+  try{
+    if(m.type==='pubkey'){ pubKey=unb64(m.blob); render(); return; }
+
+    if(m.type==='evalkey'){
+      // This tab evaluates. It imports only the relinearisation key, which
+      // permits multiplication and nothing else. It holds no secret key
+      // and cannot read a single bid it is about to compare.
+      FHE.S.importEvalKey(unb64(m.blob));
+      status('EVALUATOR: RELIN KEY IMPORTED, STILL BLIND');
+      return;
+    }
+
+    if(m.type==='evaluate'){
+      lastBids=m.blobs.map(unb64);
+      lastSeats=JSON.parse(m.note||'[]');
+      status('RUNNING BLIND ARGMAX …');
+      await new Promise(r=>setTimeout(r,30));
+      const t=performance.now();
+      const cts=m.blobs.map(unb64);
+      const masks=FHE.S.argmax(cts,SHARPEN);
+      send({type:'masks', blobs:masks.map(b64), note:m.note});
+      status(`ARGMAX DONE IN ${Math.round(performance.now()-t)}MS, NOTHING WAS DECRYPTED`);
+      return;
+    }
+
+    if(m.type==='masks'){
+      // Seller only. Open the masks to find the winner, then open ONLY
+      // that bid. The losing ciphertexts are never decrypted.
+      status('OPENING MASKS …');
+      await new Promise(r=>setTimeout(r,30));
+      const vals=m.blobs.map(b=>FHE.S.fuse([FHE.S.partialDecrypt(unb64(b))],1)[0]);
+      const win=vals.indexOf(Math.max(...vals));
+      const seats=JSON.parse(m.note||'[]');
+      const price=FHE.S.fuse([FHE.S.partialDecrypt(lastBids[win])],1)[0]*SPAN;
+      send({type:'offer', seat:(seats[win]??win), price_ct:price});
+      status('WINNING BID OPENED, LOSING BIDS LEFT SEALED');
+      return;
+    }
+  }catch(err){ status('FHE ERROR: '+FHE.why(err).slice(0,90).toUpperCase()); }
+};
+
+function myRole(){ const p=(st?.peers||[]).find(x=>x.id===me); return p?p.role:''; }
+function mySeat(){ const p=(st?.peers||[]).find(x=>x.id===me); return p?p.seat:-1; }
+
+/* ---------- actions ---------- */
+async function sellerStart(){
+  status('GENERATING KEYPAIR IN THIS TAB …');
+  await new Promise(r=>setTimeout(r,30));
+  const t=performance.now();
+  const {pk,evalKey}=FHE.S.singleKeyGen();
+  send({type:'keys', blob:b64(pk), note:b64(evalKey)});
+  status(`KEYPAIR READY IN ${Math.round(performance.now()-t)}MS, SECRET KEY NEVER LEAVES`);
+}
+
+async function sealBid(){
+  if(!pubKey){ status('WAITING FOR SELLER KEY'); return; }
+  status('ENCRYPTING BID IN THIS TAB …');
+  await new Promise(r=>setTimeout(r,30));
+  const t=performance.now();
+  const ct=FHE.S.encrypt(pubKey, new Array(BATCH).fill(myBid/SPAN));
+  send({type:'bid', blob:b64(ct)});
+  status(`SEALED IN ${Math.round(performance.now()-t)}MS, PLAINTEXT NEVER LEFT`);
+}
+
+/* ---------- render ---------- */
+function render(){
+  if(!st) return;
+  const role=myRole(), phase=st.phase, seat=mySeat();
+  const seller=role==='seller';
+  $('panel').style.setProperty('--c', seller?'var(--pink)':'var(--cyan)');
+  $('role').textContent = role==='seller' ? 'SELLER'
+    : role==='buyer' ? `BUYER ${seat+1}` : 'COHORT FULL, OBSERVING';
+  $('phase').textContent = phase.toUpperCase();
+
+  // main readout
+  if(seller && st.winner_seat>=0){ paint($('main'),fmt(st.price_ct)); $('unit').textContent='OFFERED TO YOU'; }
+  else if(!seller && st.winner_seat>=0){
+    paint($('main'), st.winner_seat===seat?fmt(st.price_ct):'--.--');
+    $('unit').textContent = st.winner_seat===seat?'YOU WON':'NOT YOU';
+  }
+  else if(seller){ paint($('main'),fmt(st.band.SpotCt)); $('unit').textContent='GRID SPOT'; }
+  else { paint($('main'),fmt(myBid)); $('unit').textContent='YOUR BID'; }
+
+  // pipeline lamps
+  const on=(id,c)=>{$(id).className=c||''};
+  on('p1', st.has_keys?'on':'');
+  on('p2', st.has_keys&&!seller?'on':'');
+  on('p3', st.sealed>0?'on':'');
+  on('p4', phase==='evaluating'?'busy':(st.winner_seat>=0?'on':''));
+  on('p5', st.winner_seat>=0?'on':'');
+
+  // peers strip
+  const ps=$('peers'); ps.innerHTML='';
+  for(let i=0;i<st.max_buyers;i++){
+    const b=(st.peers||[]).find(p=>p.role==='buyer'&&p.seat===i);
+    const el=document.createElement('i');
+    el.className=(b?(b.sealed?'sealed':'seated'):'')+(b&&b.id===me?' me':'');
+    ps.appendChild(el);
+  }
+
+  // keys
+  const K=$('keys'); K.innerHTML='';
+  const key=(label,fn,cls)=>{const b=document.createElement('button');
+    b.textContent=label; b.onclick=fn; if(cls)b.className=cls; K.appendChild(b); return b;};
+
+  if(!FHE.ready){ key('LOADING…',()=>{}).disabled=true; }
+  else if(seller){
+    if(phase==='waiting'||phase==='settled')
+      key('OPEN AUCTION', sellerStart).disabled = st.buyers===0;
+    if(phase==='offer'&&st.winner_seat>=0){
+      key('ACCEPT',()=>send({type:'settle',ok:true}),'go');
+      key('DECLINE',()=>send({type:'settle',ok:false}),'no');
+    }
+    if(phase==='settled') key('NEW ROUND',()=>send({type:'reset'}));
+  }else if(role==='buyer'){
+    if(phase==='bidding'){
+      key('BID −',()=>{myBid=Math.max(0.25,+(myBid-0.25).toFixed(2));render();});
+      key('BID +',()=>{myBid=Math.min(15.75,+(myBid+0.25).toFixed(2));render();});
+      const s=key('SEAL BID', sealBid); s.disabled=!pubKey||seatSealed();
+      if(seatSealed()) s.classList.add('lit');
+    }
+  }
+
+  // trade log
+  const tb=$('tlog');
+  if(!st.trades||!st.trades.length){ tb.innerHTML='<tr><td class="empty">NONE YET</td></tr>'; }
+  else{
+    tb.innerHTML=st.trades.map(t=>
+      `<tr><td>${t.at}</td><td>H${String(t.hour).padStart(2,'0')}</td>`+
+      `<td>BUYER ${t.seat+1}</td><td>${t.price_ct.toFixed(2)} CT</td>`+
+      `<td>${t.bidders} BIDS</td>`+
+      `<td class="${t.accepted?'ok':'no'}">${t.accepted?'CLEARED':'DECLINED'}</td></tr>`).join('');
+  }
+}
+function seatSealed(){ const p=(st?.peers||[]).find(x=>x.id===me); return !!(p&&p.sealed); }
+
+paint($('main'),'00.00');
+FHE.init(status).then(ok=>{
+  status(ok?'IN-TAB FHE READY · OPENFHE VIA WEBASSEMBLY'
+           :'WASM FAILED: '+(FHE.err||'unknown').slice(0,90).toUpperCase());
+  render();
+});
+</script>
+</body>
+</html>

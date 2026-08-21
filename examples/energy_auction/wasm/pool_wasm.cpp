@@ -3,7 +3,7 @@
 // pool_wasm exposes the browser-side surface of the uniform-price pool.
 //
 // It is a thin embind veneer over ARES-core's existing C wrapper
-// (pkg/ares/crypto/cgo/openfhe_wrapper.{h,cpp}) — the same file the Go
+// (pkg/ares/crypto/cgo/openfhe_wrapper.{h,cpp}), the same file the Go
 // bridge and the iOS/Android ports compile. Reusing it verbatim means the
 // browser runs the validated API rather than a second implementation that
 // would have to be kept in sync.
@@ -63,7 +63,7 @@ T notNull(T h, const char* what) {
 }
 
 // Session owns one CKKS context plus this tab's key share. One tab, one
-// Session — the object graph mirrors the trust boundary.
+// Session. The object graph mirrors the trust boundary.
 class Session {
 public:
     Session(uint32_t ringDim, uint32_t depth, uint32_t scalingModSize,
@@ -114,6 +114,98 @@ public:
         CiphertextHandle ct = notNull(
             Encrypt(ctx_, pk, vals.data(), static_cast<int>(vals.size())), "Encrypt");
         return toVal(serializeCT(ct));
+    }
+
+    // ---- single-key auction (the cabs trust model) -------------------
+    // The seller generates the keypair. Buyers hold no key material and
+    // encrypt under the seller's public key. The relinearisation key is
+    // derived from the secret key but is safe to publish, which is what
+    // lets a keyless peer evaluate the auction: it can multiply
+    // ciphertexts without being able to read any of them.
+
+    val singleKeyGen() {
+        PublicKeyHandle pk = nullptr;
+        SecretKeyShareHandle sk = nullptr;
+        must(KeyGenFirst(ctx_, &pk, &sk), "KeyGenFirst");
+        sk_ = sk;
+        EvalMultKeyHandle ek = nullptr;
+        must(SingleKeyEvalMultKeyGenWithOutput(ctx_, sk, &ek),
+             "SingleKeyEvalMultKeyGen");
+        uint8_t* data = nullptr;
+        size_t len = 0;
+        int rc = SerializeEvalMultKey(ek, &data, &len);
+        FreeEvalMultKey(ek);
+        must(rc, "SerializeEvalMultKey");
+
+        val out = val::object();
+        out.set("pk", toVal(serializePK(pk)));
+        out.set("evalKey", toVal(takeBuffer(data, len)));
+        return out;
+    }
+
+    // The evaluator imports the published relinearisation key. It never
+    // receives a secret key, so this grants the ability to compute on
+    // ciphertexts and nothing else.
+    void importEvalKey(const val& keyv) {
+        Bytes k = fromVal(keyv);
+        EvalMultKeyHandle ek = notNull(
+            DeserializeEvalMultKey(ctx_, const_cast<uint8_t*>(k.data()), k.size()),
+            "DeserializeEvalMultKey");
+        int rc = InsertEvalMultKey(ctx_, ek);
+        FreeEvalMultKey(ek);
+        must(rc, "InsertEvalMultKey");
+    }
+
+    // Soft-mask argmax: mask[i] = product over j != i of p(bid_i - bid_j).
+    // The winner's mask approaches 1 and every loser's approaches 0, so
+    // the evaluator produces the outcome without learning any bid.
+    val argmax(const val& ctsJS, const val& sharpen) {
+        auto coeffs = emscripten::convertJSArrayToNumberVector<double>(sharpen);
+        const unsigned n = ctsJS["length"].as<unsigned>();
+        if (n < 2) throw std::runtime_error("pool_wasm: argmax needs >= 2 bids");
+
+        std::vector<CiphertextHandle> in;
+        in.reserve(n);
+        for (unsigned i = 0; i < n; ++i) in.push_back(deserializeCT(fromVal(ctsJS[i])));
+
+        std::vector<CiphertextHandle> masks(n, nullptr);
+        int rc = EvalArgmax(ctx_, in.data(), static_cast<int>(n),
+                            coeffs.data(), static_cast<int>(coeffs.size()),
+                            masks.data());
+        for (auto h : in) FreeCiphertext(h);
+        must(rc, "EvalArgmax");
+
+        val arr = val::array();
+        for (unsigned i = 0; i < n; ++i) arr.set(i, toVal(serializeCT(masks[i])));
+        return arr;
+    }
+
+    // Sum of mask[i] * bid[i]. With a one-hot mask this is the winning
+    // bid alone. The seller learns the price it must accept or decline
+    // without ever seeing what anyone else offered.
+    val weightedSum(const val& masksJS, const val& bidsJS) {
+        const unsigned n = masksJS["length"].as<unsigned>();
+        CiphertextHandle acc = nullptr;
+        for (unsigned i = 0; i < n; ++i) {
+            CiphertextHandle m = deserializeCT(fromVal(masksJS[i]));
+            CiphertextHandle b = deserializeCT(fromVal(bidsJS[i]));
+            CiphertextHandle prod = EvalMult(ctx_, m, b);
+            FreeCiphertext(m);
+            FreeCiphertext(b);
+            if (!prod) {
+                if (acc) FreeCiphertext(acc);
+                throw std::runtime_error("pool_wasm: weightedSum EvalMult failed");
+            }
+            if (!acc) {
+                acc = prod;
+            } else {
+                CiphertextHandle sum = EvalAdd(ctx_, acc, prod);
+                FreeCiphertext(acc);
+                FreeCiphertext(prod);
+                acc = notNull(sum, "weightedSum EvalAdd");
+            }
+        }
+        return toVal(serializeCT(notNull(acc, "weightedSum")));
     }
 
     // ---- clearing circuit -------------------------------------------
@@ -235,6 +327,10 @@ EMSCRIPTEN_BINDINGS(pool_wasm) {
         .constructor<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>()
         .function("keyGenFirst", &Session::keyGenFirst)
         .function("keyGenNext", &Session::keyGenNext)
+        .function("singleKeyGen", &Session::singleKeyGen)
+        .function("importEvalKey", &Session::importEvalKey)
+        .function("argmax", &Session::argmax)
+        .function("weightedSum", &Session::weightedSum)
         .function("encrypt", &Session::encrypt)
         .function("evalAdd", &Session::evalAdd)
         .function("evalSub", &Session::evalSub)

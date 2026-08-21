@@ -3,7 +3,7 @@
 // Package main runs a browser demo of the uniform-price pool: each tab is
 // a participant, picks a side, and submits a sealed offer curve.
 //
-// The market layer here is plaintext and public by design — the price
+// The market layer here is plaintext and public by design: the price
 // grid, the reference feeds and the two synthetic grid participants are
 // all published. Only participant offer curves are sealed.
 package main
@@ -70,16 +70,13 @@ type Band struct {
 // The floor is max(0, s(t)): a plant curtails rather than pay to inject,
 // so its opportunity cost never goes below zero however negative the
 // market goes. The cap is the flat-tariff buyer's avoided energy cost.
-// The band is therefore *widest* exactly when wholesale prices collapse —
+// The band is therefore *widest* exactly when wholesale prices collapse:
 // the surplus comes from the gap between what generation is worth on the
 // market and what the buyer would otherwise pay.
 func BandAt(hour int) Band {
 	spot := DayPrices[hour%24]
 	floor := math.Max(0, spot)
 	cap := RetailEnergyRate
-	if cap > MaxGridPrice {
-		cap = MaxGridPrice
-	}
 	if floor > cap {
 		floor = cap
 	}
