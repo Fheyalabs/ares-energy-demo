@@ -125,10 +125,10 @@ func (Phase) ConsumedMessageTypes() []string { return []string{MsgBoundPartial} 
 // directly on the wire blobs.
 func (Phase) Requires() phase.ContextSchema {
 	return phase.ContextSchema{
-		CtxEncryptedInputs: {TypeName: "map[string][]byte", Required: true},
-		CtxInputDim:        {TypeName: "int", Required: true},
-		CtxEvalKeyBundle:   {TypeName: "[]byte", Required: true},
-		CtxJointPublicKey:  {TypeName: "[]byte", Required: true},
+		CtxEncryptedInputs:       {TypeName: "map[string][]byte", Required: true},
+		CtxInputDim:              {TypeName: "int", Required: true},
+		CtxEvalKeyBundle:         {TypeName: "[]byte", Required: true},
+		CtxJointPublicKey:        {TypeName: "[]byte", Required: true},
 		defaults.CtxParticipants: {TypeName: "[]string", Required: true},
 	}
 }

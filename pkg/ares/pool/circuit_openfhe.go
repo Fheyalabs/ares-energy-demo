@@ -26,6 +26,16 @@ type ClearingInputs struct {
 // at that same index, which is what participants need to compute their
 // own allocation when supply exceeds demand at the crossing.
 type ClearingOutputs struct {
+	// Step is the comparator output, ~0 below the crossing and ~1 above.
+	// It is the authoritative source for *where* the pool cleared: an odd
+	// comparator crosses 0.5 exactly at E == 0, so the first bucket at or
+	// above 0.5 is the crossing, for any gain. See DecodeCrossing.
+	Step []byte
+
+	// OneHot is Step differenced along the price axis. It is used to mask
+	// the aggregates below; it is NOT a crossing detector, because it is
+	// non-zero at every step in the aggregate curve, not only at the sign
+	// change.
 	OneHot       []byte
 	SupplyAt     []byte
 	SupplyPrevAt []byte
@@ -75,16 +85,23 @@ func LogisticCoeffs(degree int, gain float64) []float64 {
 
 // EvalClearing runs the uniform-price clearing circuit (spec §3.3).
 //
-// Depth ledger:
+// Depth ledger (measured, PinnedDepth = 7):
 //
-//	E      = S - D                    0 levels
-//	m      = poly(E/scale)            ceil(log2(deg)) + 1
-//	mPrev  = rotate(m, -1)            0 levels
-//	oneHot = m - mPrev                0 levels
-//	masked = oneHot * X               1 level   (three of these)
+//	E          = S - D                0 levels
+//	normalized = E * (1/scale)        1 level   (EvalMultConst is NOT free)
+//	m          = poly(normalized)     ~3 levels (degree 13)
+//	mPrev      = rotate(m, -1)        0 levels
+//	oneHot     = (m - mPrev) * mask   1 level
+//	masked     = oneHot * X           1 level   (three of these, in parallel)
 //
 // The rotation uses index -1 only, so the hot path needs exactly one
 // rotation key.
+//
+// Two things that cost a level despite looking free: EvalMultConst drops a
+// modulus in OpenFHE (the cgo bridge's doc comment claiming otherwise is
+// wrong), and the stage-7 products sit one level below the one-hot — so a
+// depth that runs the circuit is not necessarily a depth at which those
+// products still decrypt.
 func EvalClearing(
 	h fhecalib.ContextHandle,
 	g GridSpec,
@@ -112,20 +129,25 @@ func EvalClearing(
 		return out, fmt.Errorf("pool: excess supply: %w", err)
 	}
 
-	// Range control: divide by scale so the comparator input stays in the
-	// polynomial's trusted domain. Folded into coeffs so it costs no level.
-	scaled := make([]float64, len(coeffs))
-	inv := 1.0
-	for i, c := range coeffs {
-		scaled[i] = c * inv
-		inv /= scale
+	// Range control: divide the ciphertext by scale so the comparator
+	// input lands in the polynomial's trusted domain. Level-free.
+	//
+	// This must NOT be done by folding 1/scale^d into the coefficients.
+	// At degree 13 and scale 84 the top coefficient becomes ~5e-25, far
+	// below what CKKS represents at scaling factor 2^50, so the
+	// high-degree terms decay into noise and the comparator silently
+	// stops approximating a step.
+	normalized, err := h.EvalMultConst(excess, 1.0/scale)
+	if err != nil {
+		return out, fmt.Errorf("pool: range control: %w", err)
 	}
 
 	// Stage 4: sign test.
-	step, err := h.EvalPoly(excess, scaled)
+	step, err := h.EvalPoly(normalized, coeffs)
 	if err != nil {
 		return out, fmt.Errorf("pool: comparator: %w", err)
 	}
+	out.Step = step
 
 	// Stage 5: align bucket k-1 against bucket k along the price axis.
 	prev, err := h.EvalAtIndex(step, -1)
@@ -196,19 +218,57 @@ func EvalClearing(
 // magnitude while accepting genuine shallow crossings.
 const oneHotThreshold = 0.01
 
-// DecodeOneHot reads the clearing bucket for each delivery slot from a
-// decrypted one-hot vector.
+// DecodeCrossing reads the clearing bucket for each delivery slot from a
+// decrypted comparator output: the first bucket at or above 0.5.
 //
-// CKKS softness spreads the one-hot into a bump over a few buckets near
-// the crossing, so this takes the per-slot argmax. Where the aggregate
-// curve is flat the crossing is indeterminate by the mechanism itself,
-// not by the crypto, so any bucket in the flat region is a valid
-// tie-break (spec §3.5).
+// This is the correct readout, and it follows from the comparator's
+// oddness rather than from tuning. p(x) = 0.5 + odd terms crosses 0.5
+// exactly at x = 0 for any gain, so "first bucket where step >= 0.5" is
+// "first bucket where E >= 0" — the definition of the crossing. Softness
+// changes how sharply step rises, never where it passes 0.5.
+//
+// Bucket 0 is skipped: it is the guard (see EvalClearing stage 6).
+func DecodeCrossing(g GridSpec, step []float64) []int {
+	out := make([]int, g.NumSlots)
+	for slot := 0; slot < g.NumSlots; slot++ {
+		out[slot] = NoClearing
+		for k := 1; k < g.NumBuckets; k++ {
+			if step[g.Index(slot, k)] >= 0.5-crossingTolerance {
+				out[slot] = k
+				break
+			}
+		}
+	}
+	return out
+}
+
+// crossingTolerance absorbs CKKS jitter around the 0.5 threshold.
+//
+// A strict `>= 0.5` is a knife-edge, and the knife-edge is the *common*
+// case rather than a rare one: at the crossing supply meets demand, so
+// E == 0 exactly and the comparator returns exactly 0.5. Measured jitter
+// there is ~3e-7 and lands on either side at random, which would make the
+// clearing bucket a coin flip between k* and k*+1.
+//
+// 1e-3 sits three orders of magnitude above that jitter and far below the
+// next plateau down (measured 0.12-0.27 on the reference cohorts), so it
+// resolves the tie without ever reaching into a genuinely lower bucket.
+const crossingTolerance = 1e-3
+
+// DecodeOneHot reports, per delivery slot, the bucket carrying the
+// largest one-hot bump.
+//
+// It is NOT a crossing detector and must not be used as one: the one-hot
+// is non-zero wherever the aggregate curve steps, so its argmax finds the
+// biggest jump in the curve, which coincides with the crossing only by
+// accident. Use DecodeCrossing. This is retained because the bump
+// amplitude at a known bucket is what DecodeClearing divides out of the
+// masked aggregates.
 func DecodeOneHot(g GridSpec, oneHot []float64) []int {
 	out := make([]int, g.NumSlots)
 	for slot := 0; slot < g.NumSlots; slot++ {
 		best, bestVal := NoClearing, oneHotThreshold
-		for k := 0; k < g.NumBuckets; k++ {
+		for k := 1; k < g.NumBuckets; k++ {
 			v := oneHot[g.Index(slot, k)]
 			if v > bestVal {
 				best, bestVal = k, v
@@ -229,8 +289,8 @@ func DecodeOneHot(g GridSpec, oneHot []float64) []int {
 // is divided by the one-hot value at the same index. The quotient is
 // exact regardless of what amplitude the comparator happened to produce,
 // which is what makes the readout insensitive to comparator gain.
-func DecodeClearing(g GridSpec, oneHot, supplyAt, supplyPrevAt, demandAt []float64) []SlotResult {
-	buckets := DecodeOneHot(g, oneHot)
+func DecodeClearing(g GridSpec, step, oneHot, supplyAt, supplyPrevAt, demandAt []float64) []SlotResult {
+	buckets := DecodeCrossing(g, step)
 	out := make([]SlotResult, g.NumSlots)
 	for slot, k := range buckets {
 		if k == NoClearing {
@@ -239,6 +299,12 @@ func DecodeClearing(g GridSpec, oneHot, supplyAt, supplyPrevAt, demandAt []float
 		}
 		idx := g.Index(slot, k)
 		m := oneHot[idx]
+		if m < oneHotThreshold {
+			// The crossing carries too little bump amplitude to divide
+			// through safely; report the price but not the quantities.
+			out[slot] = SlotResult{Bucket: k, PriceCt: g.Price(k)}
+			continue
+		}
 		res := SlotResult{
 			Bucket:     k,
 			PriceCt:    g.Price(k),
@@ -264,7 +330,7 @@ func DecodeClearing(g GridSpec, oneHot, supplyAt, supplyPrevAt, demandAt []float
 // projected 7. Depth 5 is also the lowest depth at which the circuit
 // runs at all (TestClearingCircuit_MinimumRunnableDepth), so accuracy is
 // not the binding constraint here; the level count is.
-const PinnedDepth uint32 = 5
+const PinnedDepth uint32 = 7
 
 // ClearingCircuit adapts EvalClearing to fhecalib.CircuitUnderTest so
 // the depth sweep can measure the circuit instead of guessing at it.
@@ -314,7 +380,12 @@ func (c ClearingCircuit) Expected(inputs [][]float64) []float64 {
 			if k > 0 {
 				prev = step[idx-1]
 			}
-			out[idx] = (step[idx] - prev) * mask[idx]
+			// Mirror stage 7's masked supply, not the bare one-hot: it is
+			// the circuit's DEEPEST output, so calibrating against it
+			// measures the whole modulus chain. Calibrating the one-hot
+			// alone under-measures by a level, and the stage-7 products
+			// then fail to decrypt at the "calibrated" depth.
+			out[idx] = (step[idx] - prev) * mask[idx] * inputs[0][idx]
 		}
 	}
 	return out
@@ -331,7 +402,7 @@ func (c ClearingCircuit) Eval(h fhecalib.ContextHandle, encInputs [][]byte) ([]b
 	if err != nil {
 		return nil, err
 	}
-	return out.OneHot, nil
+	return out.SupplyAt, nil
 }
 
 // evalPolyAt evaluates an ascending-order coefficient list by Horner.

@@ -76,12 +76,12 @@ func classify(value float64, b Bound, p Params) (nu float64, sev Severity) {
 // Requires them. (Use defaults.CtxParticipants for the participant set — NOT a
 // boundcheck-local copy.)
 const (
-	CtxEncryptedInputs   = "boundcheck.encrypted_inputs"  // map[string][]byte: party -> lineage-committed ciphertext
-	CtxInputDim          = "boundcheck.input_dim"         // int: slot count of each input vector
-	CtxEvalKeyBundle     = "boundcheck.eval_key_bundle"   // serialized cgo.EvalKeyFinal
-	CtxJointPublicKey    = "boundcheck.joint_public_key"  // []byte: pk_joint
-	CtxBoundCheckCiphers      = "boundcheck.check_ciphertexts"  // map[string][]byte: party -> enc_check (phase Provides; app unicasts)
-	CtxBoundCheckCommitments  = "boundcheck.check_commitments"  // map[string][]byte: party -> H(enc_check ‖ H(enc_x) ‖ session_id)
+	CtxEncryptedInputs       = "boundcheck.encrypted_inputs"  // map[string][]byte: party -> lineage-committed ciphertext
+	CtxInputDim              = "boundcheck.input_dim"         // int: slot count of each input vector
+	CtxEvalKeyBundle         = "boundcheck.eval_key_bundle"   // serialized cgo.EvalKeyFinal
+	CtxJointPublicKey        = "boundcheck.joint_public_key"  // []byte: pk_joint
+	CtxBoundCheckCiphers     = "boundcheck.check_ciphertexts" // map[string][]byte: party -> enc_check (phase Provides; app unicasts)
+	CtxBoundCheckCommitments = "boundcheck.check_commitments" // map[string][]byte: party -> H(enc_check ‖ H(enc_x) ‖ session_id)
 
 	// CtxBoundCheckHandle / CtxBoundCheckFuse let a shared-runner session-service
 	// supply a PER-SESSION fhecalib.ContextHandle and fuse function via the

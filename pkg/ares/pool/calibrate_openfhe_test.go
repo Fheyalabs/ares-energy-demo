@@ -47,8 +47,8 @@ func TestCalibrate_ClearingCircuitDepth(t *testing.T) {
 		// circuit can *run*: fhecalib.sweep treats an evaluation error as
 		// fatal rather than "try deeper", so starting too shallow aborts
 		// the sweep with "EvalMult failed" instead of advancing.
-		// TestClearingCircuit_MinimumRunnableDepth pins that floor at 5.
-		StartDepth: 5,
+		// TestClearingCircuit_MinimumRunnableDepth pins that floor at 7.
+		StartDepth: 7,
 		MaxDepth:   14,
 		Tolerance:  0.35,
 	}, g.Len())
@@ -89,13 +89,18 @@ func TestClearingCircuit_MinimumRunnableDepth(t *testing.T) {
 		if err != nil {
 			t.Fatalf("depth %d: encrypt demand: %v", depth, err)
 		}
-		_, err = EvalClearing(env.handle, g, ClearingInputs{Supply: ctS, Demand: ctD},
+		res, err := EvalClearing(env.handle, g, ClearingInputs{Supply: ctS, Demand: ctD},
 			LogisticCoeffs(13, 4.0), 8.0)
 		if err != nil {
 			t.Logf("depth %2d: cannot run (%v)", depth, err)
 			continue
 		}
-		t.Logf("depth %2d: runs", depth)
+		// Running is not enough: the deepest output must also decrypt.
+		if _, err := envDecrypt(env, res.SupplyAt, g.Len()); err != nil {
+			t.Logf("depth %2d: runs but deepest output will not decrypt (%v)", depth, err)
+			continue
+		}
+		t.Logf("depth %2d: runs and decrypts", depth)
 		if first == 0 {
 			first = depth
 		}
@@ -199,7 +204,7 @@ func TestComparator_CrossingIndependentOfGain(t *testing.T) {
 		if err != nil {
 			t.Fatalf("gain %v: EvalClearing: %v", gain, err)
 		}
-		got := DecodeOneHot(g, env.decrypt(t, out.OneHot, g.Len()))
+		got := DecodeCrossing(g, env.decrypt(t, out.Step, g.Len()))
 		if got[0] != want[0].Bucket {
 			t.Errorf("gain %v: bucket %d, want %d", gain, got[0], want[0].Bucket)
 		}

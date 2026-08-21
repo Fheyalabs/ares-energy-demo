@@ -50,6 +50,9 @@ func (h *fakeContextHandle) EvalPoly(ct []byte, coeffs []float64) ([]byte, error
 func (h *fakeContextHandle) EvalAtIndex(ct []byte, index int) ([]byte, error) {
 	return h.cannedCT, nil
 }
+func (h *fakeContextHandle) EvalMultConst(ct []byte, scalar float64) ([]byte, error) {
+	return h.cannedCT, nil
+}
 func (h *fakeContextHandle) Encrypt(vals []float64) ([]byte, error) { return h.cannedCT, nil }
 
 // captureHandler records every OnViolation call for assertions.
@@ -238,7 +241,7 @@ func TestPhase_Exit_ViolationCallsHandlerAndAborts(t *testing.T) {
 	//
 	// To signal a violation for "bob", we make alice's partial for "bob" start with 'v':
 	aliceMap := map[string][]byte{
-		"alice": []byte("alice-partial-of-alice"), // 'a' -> in-bound
+		"alice": []byte("alice-partial-of-alice"),   // 'a' -> in-bound
 		"bob":   []byte("violating-partial-of-bob"), // 'v' -> out-of-bound
 	}
 	alicePayload, _ := json.Marshal(aliceMap)

@@ -151,12 +151,12 @@ func TestEvalClearing_MatchesOracle(t *testing.T) {
 		t.Fatalf("EvalClearing: %v", err)
 	}
 
-	oneHot := env.decrypt(t, out.OneHot, g.Len())
-	got := DecodeOneHot(g, oneHot)
+	step := env.decrypt(t, out.Step, g.Len())
+	got := DecodeCrossing(g, step)
 	for slot := range want {
 		if got[slot] != want[slot].Bucket {
-			t.Errorf("slot %d: circuit bucket %d, oracle bucket %d (one-hot %v)",
-				slot, got[slot], want[slot].Bucket, oneHot[slot*g.NumBuckets:(slot+1)*g.NumBuckets])
+			t.Errorf("slot %d: circuit bucket %d, oracle bucket %d (step %v)",
+				slot, got[slot], want[slot].Bucket, step[slot*g.NumBuckets:(slot+1)*g.NumBuckets])
 		}
 	}
 }
@@ -194,6 +194,7 @@ func TestEvalClearing_RationingScalars(t *testing.T) {
 	}
 
 	got := DecodeClearing(g,
+		env.decrypt(t, out.Step, g.Len()),
 		env.decrypt(t, out.OneHot, g.Len()),
 		env.decrypt(t, out.SupplyAt, g.Len()),
 		env.decrypt(t, out.SupplyPrevAt, g.Len()),
@@ -266,4 +267,62 @@ func TestDecodeOneHot_NoClearingWhenFlat(t *testing.T) {
 			t.Errorf("slot %d = %d, want NoClearing", slot, k)
 		}
 	}
+}
+
+// Regression: the crossing is not always the largest step in the
+// aggregate curve. Here a large elastic seller sits well above the
+// crossing, so its step dwarfs the true one — DecodeOneHot's argmax
+// picks the wrong bucket and DecodeCrossing must not.
+func TestDecodeCrossing_NotTheLargestStep(t *testing.T) {
+	g := testGrid()
+	sup := mustEncode(t, EncodeSupply, g, []Offer{
+		{Slot: 0, PriceCt: 0.50, Quantity: 2},  // true crossing here
+		{Slot: 0, PriceCt: 1.50, Quantity: 40}, // much bigger step, far above
+	})
+	dem := mustEncode(t, EncodeDemand, g, []Offer{{Slot: 0, PriceCt: 1.75, Quantity: 2}})
+	want, err := ClearPlaintext(g, sup, dem)
+	if err != nil {
+		t.Fatalf("oracle: %v", err)
+	}
+
+	env := newTestEnv(t, 8192, PinnedDepth)
+	h := env.handle
+	ctS, err := h.Encrypt(sup)
+	if err != nil {
+		t.Fatalf("encrypt supply: %v", err)
+	}
+	ctD, err := h.Encrypt(dem)
+	if err != nil {
+		t.Fatalf("encrypt demand: %v", err)
+	}
+
+	// Scale to roughly 2x the largest |E| so the comparator argument stays
+	// in [-0.5, 0.5] and the degree-13 series stays in its trusted domain.
+	out, err := EvalClearing(h, g, ClearingInputs{Supply: ctS, Demand: ctD},
+		LogisticCoeffs(13, 4.0), 84.0)
+	if err != nil {
+		t.Fatalf("EvalClearing: %v", err)
+	}
+
+	gotCross := DecodeCrossing(g, env.decrypt(t, out.Step, g.Len()))
+	if gotCross[0] != want[0].Bucket {
+		t.Errorf("DecodeCrossing = %d, want %d", gotCross[0], want[0].Bucket)
+	}
+	gotArgmax := DecodeOneHot(g, env.decrypt(t, out.OneHot, g.Len()))
+	t.Logf("crossing=%d (correct), one-hot argmax=%d, oracle=%d",
+		gotCross[0], gotArgmax[0], want[0].Bucket)
+}
+
+// envDecrypt is decrypt without t.Fatalf, for probes that need to
+// distinguish "did not decrypt" from "test failed".
+func envDecrypt(e *testEnv, ct []byte, nSlots int) ([]float64, error) {
+	p1, err := cgo.PartialDecryptCKKSForContract(e.params, ct, e.first.SecretKeyShare, e.first.Lead)
+	if err != nil {
+		return nil, err
+	}
+	p2, err := cgo.PartialDecryptCKKSForContract(e.params, ct, e.second.SecretKeyShare, e.second.Lead)
+	if err != nil {
+		return nil, err
+	}
+	return cgo.FuseCKKSPartialsForContract(e.params, [][]byte{p1, p2}, nSlots)
 }

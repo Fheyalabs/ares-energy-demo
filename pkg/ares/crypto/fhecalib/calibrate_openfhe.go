@@ -79,6 +79,10 @@ func (h *cgoHandle) EvalPoly(ct []byte, coeffs []float64) ([]byte, error) {
 	return cgo.EvalPolyCKKSForContract(h.cgoParams, h.evalKeys.EvalMultFinal, ct, coeffs)
 }
 
+func (h *cgoHandle) EvalMultConst(ct []byte, scalar float64) ([]byte, error) {
+	return cgo.EvalConstMultCKKSForContract(h.cgoParams, ct, scalar)
+}
+
 func (h *cgoHandle) EvalAtIndex(ct []byte, index int) ([]byte, error) {
 	return cgo.EvalAtIndexCKKSForContract(h.cgoParams, h.evalKeys.EvalSumFinal, ct, index)
 }

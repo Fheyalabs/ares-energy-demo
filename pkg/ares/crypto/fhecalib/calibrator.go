@@ -35,6 +35,10 @@ type ContextHandle interface {
 	// EvalPoly applies p(x) = sum(coeffs[i] * x^i) slot-wise. coeffs is
 	// in ascending order. Consumes ceil(log2(deg)) + 1 levels.
 	EvalPoly(ct []byte, coeffs []float64) ([]byte, error)
+	// EvalMultConst multiplies a ciphertext by a cleartext scalar.
+	// Level-free. Prefer this over folding a scale factor into polynomial
+	// coefficients: c/s^d underflows CKKS precision for large s and high d.
+	EvalMultConst(ct []byte, scalar float64) ([]byte, error)
 	// EvalAtIndex rotates a ciphertext along its slot axis. A positive
 	// index shifts slot i+index into slot i. Level-free.
 	EvalAtIndex(ct []byte, index int) ([]byte, error)
@@ -70,7 +74,7 @@ type CalibrationParams struct {
 // CalibrationResult reports the sweep outcome.
 type CalibrationResult struct {
 	Circuit          string
-	Depth            uint32  // minimum viable depth (valid when Passed)
+	Depth            uint32 // minimum viable depth (valid when Passed)
 	ScalingModSize   int
 	RingDim          uint32
 	AchievedAbsError float64 // best (smallest) worst-slot abs error seen

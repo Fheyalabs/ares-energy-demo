@@ -1262,7 +1262,13 @@ func EvalAtIndexCKKSForContract(params ContractParams, evalSumKey, ct []byte, in
 }
 
 // EvalConstMultCKKSForContract multiplies a ciphertext by a cleartext
-// scalar (does not consume a level).
+// scalar.
+//
+// This DOES consume a multiplicative level. OpenFHE implements it as
+// EvalMult(ct, double), which rescales and drops a modulus like any other
+// multiplication. An earlier version of this comment claimed otherwise;
+// circuits sized against that claim exhaust their depth budget one
+// operation early.
 func EvalConstMultCKKSForContract(params ContractParams, ct []byte, scalar float64) ([]byte, error) {
 	if len(ct) == 0 {
 		return nil, fmt.Errorf("ciphertext is required")
