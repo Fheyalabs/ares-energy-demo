@@ -269,8 +269,16 @@ func (h *hub) handle(id string, m msg) {
 		h.auction.CloseEpoch(m.Price, m.Ok)
 		h.broadcast()
 
+	// A new epoch has to reset every tab's local ledger, not just the one
+	// that pressed the button. Each tab tracks its own net position, so a
+	// tab that keeps last epoch's figure reports a total covering two
+	// epochs while the others report one, and the audit shows an
+	// imbalance exactly equal to the epoch that was left behind.
 	case "newepoch":
 		h.auction.NewEpoch()
+		for _, pid := range h.peerIDs() {
+			h.send(pid, msg{Type: "epochreset"})
+		}
 		h.broadcast()
 
 	case "reset":

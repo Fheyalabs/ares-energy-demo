@@ -218,11 +218,26 @@ const status=s=>$('status').textContent=s;
 
 ws.onmessage=async e=>{
   const m=JSON.parse(e.data);
-  if(m.type==='state'){ me=m.you; st=m.state; render(); return; }
+  if(m.type==='state'){
+    me=m.you; st=m.state;
+    // The seller's key is only valid while the relay says a round is
+    // keyed. Tying the local copy to that removes any dependence on
+    // message ordering: without it a buyer can seal under the previous
+    // round's key, which the seller no longer holds a secret for.
+    if(!st.has_keys) pubKey=null;
+    render(); return;
+  }
   if(!FHE.ready) return;
 
   try{
     if(m.type==='pubkey'){ pubKey=unb64(m.blob); render(); return; }
+
+    // Every tab clears its own ledger, key share and epoch context.
+    if(m.type==='epochreset'){
+      myNet=0; myWins=[]; epochS=null; epochKey=null;
+      status('NEW EPOCH: LEDGER AND KEY SHARE CLEARED');
+      render(); return;
+    }
 
     // Sent to exactly one tab. Everyone else only ever sees that a trade
     // settled at some price, with no name attached to it.
@@ -433,8 +448,7 @@ function renderInner(){
     }
     // Enough trades have settled to audit the books in aggregate.
     if(st.epoch==='ready') key('CLEAR EPOCH', epochStart, 'go');
-    if(st.epoch==='done')  key('NEW EPOCH', ()=>{ myNet=0; myWins=[];
-        epochS=null; epochKey=null; send({type:'newepoch'}); });
+    if(st.epoch==='done')  key('NEW EPOCH', ()=>send({type:'newepoch'}));
   }else if(role==='buyer'){
     if(phase==='bidding'){
       key('BID −',()=>{myBid=Math.max(0.25,+(myBid-0.25).toFixed(2));render();});

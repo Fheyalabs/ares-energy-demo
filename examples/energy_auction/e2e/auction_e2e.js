@@ -18,6 +18,7 @@ const SHARPEN = [0.5, 0.5];
 const SPAN = 16.0;
 const BIDS = [6.25, 7.50, 5.00, 9.75, 8.00]; // seat 3 must win
 const EPOCH = 5;
+const EPOCHS = 2;   // the ledger-reset bug only appears from epoch 2 on
 
 const b64 = u8 => Buffer.from(u8).toString('base64');
 const unb64 = s => new Uint8Array(Buffer.from(s, 'base64'));
@@ -55,8 +56,18 @@ class Tab {
 
   onMessage(m) {
     try {
-      if (m.type === 'state') { this.me = m.you; this.state = m.state; return; }
+      if (m.type === 'state') {
+        this.me = m.you; this.state = m.state;
+        // Same invariant as the browser: a stale public key must never
+        // survive into the next round.
+        if (!this.state.has_keys) this.pubKey = null;
+        return;
+      }
       if (m.type === 'pubkey') { this.pubKey = unb64(m.blob); return; }
+      if (m.type === 'epochreset') {
+        this.net = 0; this.wins = 0; this.epochS = null; this.verified = undefined;
+        return;
+      }
 
       // Sent to exactly one tab.
       if (m.type === 'won') { this.net += m.price_ct; this.wins++; return; }
@@ -151,11 +162,11 @@ async function until(fn, label, ms = 60000) {
   }
   console.log(`seated: 1 seller + ${buyers.length} buyers`);
 
+for (let ep = 1; ep <= EPOCHS; ep++) {
+  console.log(`\n=== epoch ${ep} ===`);
   for (let round = 1; round <= EPOCH; round++) {
-    if (round > 1) {
-      await until(() => seller.state?.phase === 'settled', 'settled');
-      for (const b of buyers) b.pubKey = null;
-    }
+    if (round > 1) await until(() => seller.state?.phase === 'settled', 'settled');
+    await until(() => buyers.every(b => !b.pubKey), 'stale keys cleared');
     const { pk, evalKey } = seller.S.singleKeyGen();
     seller.send({ type: 'keys', blob: b64(pk), note: b64(evalKey) });
     await until(() => buyers.every(b => b.pubKey), 'public key delivered');
@@ -214,6 +225,17 @@ async function until(fn, label, ms = 60000) {
   const pass = !named && othersBlind && winner.wins === EPOCH
     && slots.length === EPOCH && new Set(slots).size === EPOCH
     && ok === expectBalanced && sellerAlone !== 'OPENED (bad)' && allAgree;
-  console.log(pass ? 'E2E_OK' : 'E2E_FAIL');
-  process.exit(pass ? 0 : 1);
+  if (!pass) { console.log(`E2E_FAIL in epoch ${ep}`); process.exit(1); }
+  console.log(`epoch ${ep} OK`);
+
+  if (ep < EPOCHS) {
+    seller.send({ type: 'newepoch' });
+    await until(() => seller.state?.epoch === 'open'
+      && (seller.state?.trades || []).length === 0, 'new epoch');
+    // Every tab must have cleared its own ledger, not just the seller.
+    await until(() => [seller, ...buyers].every(x => x.net === 0), 'ledgers cleared');
+  }
+}
+  console.log('\nE2E_OK');
+  process.exit(0);
 })().catch(e => { console.error('ERROR:', why(e) || e); process.exit(1); });
