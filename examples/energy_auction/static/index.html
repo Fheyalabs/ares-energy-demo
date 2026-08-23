@@ -173,9 +173,6 @@ const FHE = {
 /* ---------- state ---------- */
 const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
 let me=null, st=null, myBid=8.00, pubKey=null;
-// The seller keeps the ciphertext set it was asked to rank, so it can open
-// the winning one without a second round trip.
-let lastBids=[], lastSeats=[];
 const send=o=>ws.readyState===1&&ws.send(JSON.stringify(o));
 const status=s=>$('status').textContent=s;
 
@@ -197,13 +194,15 @@ ws.onmessage=async e=>{
     }
 
     if(m.type==='evaluate'){
-      lastBids=m.blobs.map(unb64);
-      lastSeats=JSON.parse(m.note||'[]');
       status('RUNNING BLIND ARGMAX …');
       await new Promise(r=>setTimeout(r,30));
       const t=performance.now();
       const cts=m.blobs.map(unb64);
-      const masks=FHE.S.argmax(cts,SHARPEN);
+      // With one bidder there is nothing to compare, and argmax refuses
+      // n < 2. Hand back a mask of 1 so the seller's readout is uniform.
+      const masks = cts.length<2
+        ? [FHE.S.encrypt(pubKey, new Array(BATCH).fill(1.0))]
+        : FHE.S.argmax(cts,SHARPEN);
       send({type:'masks', blobs:masks.map(b64), note:m.note});
       status(`ARGMAX DONE IN ${Math.round(performance.now()-t)}MS, NOTHING WAS DECRYPTED`);
       return;
@@ -217,7 +216,9 @@ ws.onmessage=async e=>{
       const vals=m.blobs.map(b=>FHE.S.fuse([FHE.S.partialDecrypt(unb64(b))],1)[0]);
       const win=vals.indexOf(Math.max(...vals));
       const seats=JSON.parse(m.note||'[]');
-      const price=FHE.S.fuse([FHE.S.partialDecrypt(lastBids[win])],1)[0]*SPAN;
+      const bids=(m.bids||[]).map(unb64);
+      if(!bids[win]) throw new Error('relay sent no ciphertext for the winning seat');
+      const price=FHE.S.fuse([FHE.S.partialDecrypt(bids[win])],1)[0]*SPAN;
       send({type:'offer', seat:(seats[win]??win), price_ct:price});
       status('WINNING BID OPENED, LOSING BIDS LEFT SEALED');
       return;

@@ -49,6 +49,7 @@ type msg struct {
 	Type  string   `json:"type"`
 	Blob  string   `json:"blob,omitempty"`
 	Blobs []string `json:"blobs,omitempty"`
+	Bids  []string `json:"bids,omitempty"`
 	Seat  int      `json:"seat,omitempty"`
 	Price float64  `json:"price_ct,omitempty"`
 	Hour  int      `json:"hour,omitempty"`
@@ -157,6 +158,13 @@ func (h *hub) handle(id string, m msg) {
 
 	// The evaluator finished the blind argmax. Masks go to the seller,
 	// which is the only party holding a key that can open them.
+	//
+	// The bid ciphertexts go with them. The seller has to open the winning
+	// one to learn the price, and the evaluator cannot pick it out. Being
+	// blind is the whole point, so it has no idea which mask won. Sending
+	// the set costs nothing the trust model did not already concede: the
+	// seller holds the secret key and could open any of them. What the
+	// protocol says is that it opens exactly one.
 	case "masks":
 		blobs := make([][]byte, len(m.Blobs))
 		for i, b := range m.Blobs {
@@ -164,7 +172,13 @@ func (h *hub) handle(id string, m msg) {
 		}
 		h.auction.SetMasks(blobs)
 		if s := h.auction.SellerID(); s != "" {
-			h.send(s, msg{Type: "masks", Blobs: m.Blobs, Note: m.Note})
+			cts, seats := h.auction.OrderedBids()
+			bids := make([]string, len(cts))
+			for i, ct := range cts {
+				bids[i] = string(ct)
+			}
+			seatJSON, _ := json.Marshal(seats)
+			h.send(s, msg{Type: "masks", Blobs: m.Blobs, Bids: bids, Note: string(seatJSON)})
 		}
 		h.broadcast()
 
