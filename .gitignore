@@ -44,3 +44,7 @@ clients/rideshareswift/.build/
 
 # pool_demo WASM build artifacts (2.7 MB); rebuild with examples/energy_auction/wasm/build.sh
 examples/energy_auction/static/wasm/
+
+# Editor, IDE and local-only configuration
+xcuserdata/
+Local.xcconfig
