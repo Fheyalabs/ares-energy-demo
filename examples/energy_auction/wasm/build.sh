@@ -25,10 +25,12 @@
 # exceptions, emmalloc), so this is configuration, not porting.
 set -euo pipefail
 
-EMSDK=${EMSDK_ROOT:-/Volumes/Hardik_external_T7/emsdk}
-OF_SRC=${OPENFHE_SRC:-$HOME/Fheya/openfhe-development}
-OF_BUILD=${OPENFHE_WASM_BUILD:-/Volumes/Hardik_external_T7/openfhe-wasm-build}
-OF_PREFIX=${OPENFHE_WASM_PREFIX:-/Volumes/Hardik_external_T7/openfhe-wasm}
+# Every path is overridable. Defaults assume side-by-side checkouts in
+# $HOME; set the variables if yours live elsewhere.
+EMSDK=${EMSDK_ROOT:-$HOME/emsdk}
+OF_SRC=${OPENFHE_SRC:-$HOME/openfhe-development}
+OF_BUILD=${OPENFHE_WASM_BUILD:-$HOME/openfhe-wasm-build}
+OF_PREFIX=${OPENFHE_WASM_PREFIX:-$HOME/openfhe-wasm}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 DEMO=$(dirname "$HERE")
@@ -36,8 +38,13 @@ REPO=$(cd "$DEMO/../.." && pwd)
 WRAP="$REPO/pkg/ares/crypto/cgo"
 OUT="$DEMO/static/wasm"
 
-export PATH=/opt/homebrew/bin:$PATH
+# Homebrew first on macOS, so a modern python3 shadows the Xcode one.
+[ -d /opt/homebrew/bin ] && export PATH=/opt/homebrew/bin:$PATH
 # shellcheck disable=SC1091
+if [ ! -f "$EMSDK/emsdk_env.sh" ]; then
+  echo "emsdk not found at $EMSDK. Set EMSDK_ROOT." >&2
+  exit 1
+fi
 source "$EMSDK/emsdk_env.sh" >/dev/null 2>&1
 
 INC="-I$WRAP -I$OF_PREFIX/include/openfhe -I$OF_PREFIX/include/openfhe/core -I$OF_PREFIX/include/openfhe/pke -I$OF_PREFIX/include/openfhe/binfhe -I$OF_PREFIX/include/openfhe/cereal"
@@ -45,6 +52,10 @@ WARN="-Wno-error -Wno-unused-template -Wno-unused-function -Wno-unused-but-set-v
 
 if [ ! -f "$OF_PREFIX/lib/libOPENFHEpke_static.a" ]; then
   echo "=== building OpenFHE for WASM (long) ==="
+  if [ ! -d "$OF_SRC" ]; then
+    echo "OpenFHE source not found at $OF_SRC. Set OPENFHE_SRC." >&2
+    exit 1
+  fi
   mkdir -p "$OF_BUILD"; cd "$OF_BUILD"
   emcmake cmake "$OF_SRC" \
     -DCMAKE_BUILD_TYPE=Release \
