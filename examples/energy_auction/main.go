@@ -187,8 +187,58 @@ func (h *hub) handle(id string, m msg) {
 		h.auction.Offer(m.Seat, m.Price)
 		h.broadcast()
 
+	// The seller decided. Only the winning buyer is told it won; every
+	// other tab sees a settled trade in the log with no name on it.
 	case "settle":
-		h.auction.Settle(m.Ok)
+		seat := h.auction.Settle(m.Ok)
+		if seat >= 0 && m.Ok {
+			if w := h.auction.PeerAtSeat(seat); w != "" {
+				h.send(w, msg{Type: "won", Seat: seat, Price: m.Price})
+			}
+		}
+		h.broadcast()
+
+	// ---- epoch audit ------------------------------------------------
+	// After EpochSize trades the books are checked in aggregate. Each tab
+	// encrypts its own net position for the epoch; a blind peer sums the
+	// ciphertexts; the seller opens the sum and nothing else. No
+	// individual total, and no individual trade, is ever reopened.
+
+	case "epochopen":
+		h.auction.OpenEpochAudit([]byte(m.Blob))
+		h.broadcast()
+		for _, pid := range h.peerIDs() {
+			h.send(pid, msg{Type: "epochkey", Blob: m.Blob})
+		}
+
+	case "epochtotal":
+		if !h.auction.SubmitEpochTotal(id, []byte(m.Blob)) {
+			h.broadcast()
+			return
+		}
+		cts := h.auction.EpochCiphertexts()
+		blobs := make([]string, len(cts))
+		for i, ct := range cts {
+			blobs[i] = string(ct)
+		}
+		if ev := h.auction.Evaluator(); ev != nil {
+			h.send(ev.ID, msg{Type: "epochsum", Blobs: blobs})
+		}
+		h.broadcast()
+
+	// The blind peer returns the summed ciphertext; only the seller can
+	// open it.
+	case "epochsummed":
+		if sid := h.auction.SellerID(); sid != "" {
+			h.send(sid, msg{Type: "epochopen", Blob: m.Blob})
+		}
+
+	case "epochresult":
+		h.auction.CloseEpoch(m.Price, m.Ok)
+		h.broadcast()
+
+	case "newepoch":
+		h.auction.NewEpoch()
 		h.broadcast()
 
 	case "reset":

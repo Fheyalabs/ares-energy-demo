@@ -133,7 +133,7 @@ button:disabled{opacity:.38;cursor:not-allowed;transform:none}
 <div class="keys" id="keys"></div>
 
 <div class="log">
-  <h4>SETTLED TRADES</h4>
+  <h4 id="loghead">SETTLED TRADES</h4>
   <table><tbody id="tlog"><tr><td class="empty">NONE YET</td></tr></tbody></table>
 </div>
 
@@ -195,7 +195,13 @@ const FHE = {
 
 /* ---------- state ---------- */
 const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-let me=null, st=null, myBid=8.00, pubKey=null;
+let me=null, st=null, myBid=8.00, pubKey=null, epochKey=null;
+
+// Each tab keeps only its OWN epoch position. A buyer adds what it paid on
+// the trades it won; the seller adds what it took in. Nobody accumulates
+// anyone else's figures, which is what makes the aggregate audit meaningful
+// rather than decorative.
+let myNet=0, myWins=[];
 const send=o=>ws.readyState===1&&ws.send(JSON.stringify(o));
 const status=s=>$('status').textContent=s;
 
@@ -206,6 +212,49 @@ ws.onmessage=async e=>{
 
   try{
     if(m.type==='pubkey'){ pubKey=unb64(m.blob); render(); return; }
+
+    // Sent to exactly one tab. Everyone else only ever sees that a trade
+    // settled at some price, with no name attached to it.
+    if(m.type==='won'){
+      myNet += m.price_ct;
+      myWins.push((st?.trades||[]).length);
+      status(`YOU WON THIS ROUND AT ${m.price_ct.toFixed(2)} CT, NOBODY ELSE IS TOLD`);
+      render(); return;
+    }
+
+    // ---- epoch audit ----------------------------------------------
+    if(m.type==='epochkey'){
+      epochKey=unb64(m.blob);
+      // Encrypt this tab's own epoch total and hand over the ciphertext.
+      // Buyers are positive (spent), the seller negative (received), so an
+      // honest set sums to zero.
+      const sign = myRole()==='seller' ? -1 : 1;
+      const ct=FHE.S.encrypt(epochKey, new Array(BATCH).fill(sign*myNet/SPAN));
+      send({type:'epochtotal', blob:b64(ct)});
+      status('EPOCH TOTAL SEALED, YOUR FIGURE STAYS SEALED');
+      return;
+    }
+
+    if(m.type==='epochsum'){
+      // Blind peer: add the ciphertexts. It never learns a single total,
+      // its own excepted, and never learns the sum either.
+      let acc=unb64(m.blobs[0]);
+      for(let i=1;i<m.blobs.length;i++) acc=FHE.S.evalAdd(acc,unb64(m.blobs[i]));
+      send({type:'epochsummed', blob:b64(acc)});
+      status('EPOCH TOTALS SUMMED UNDER ENCRYPTION');
+      return;
+    }
+
+    if(m.type==='epochopen'){
+      // Seller opens ONLY the sum. No participant total is decrypted, and
+      // no settled trade is reopened.
+      const net=FHE.S.fuse([FHE.S.partialDecrypt(unb64(m.blob))],1)[0]*SPAN;
+      const ok=Math.abs(net)<0.05;
+      send({type:'epochresult', price_ct:net, ok});
+      status(ok?'BOOKS BALANCE, AGGREGATE OPENED, NO TRADE REPLAYED'
+               :`IMBALANCE ${net.toFixed(2)} CT, SOMEONE MISREPORTED`);
+      return;
+    }
 
     if(m.type==='evalkey'){
       // This tab evaluates. It imports only the relinearisation key, which
@@ -260,6 +309,13 @@ async function sellerStart(){
   const {pk,evalKey}=FHE.S.singleKeyGen();
   send({type:'keys', blob:b64(pk), note:b64(evalKey)});
   status(`KEYPAIR READY IN ${Math.round(performance.now()-t)}MS, SECRET KEY NEVER LEAVES`);
+}
+
+async function epochStart(){
+  status('OPENING EPOCH AUDIT …');
+  await new Promise(r=>setTimeout(r,30));
+  const {pk}=FHE.S.singleKeyGen();
+  send({type:'epochopen', blob:b64(pk)});
 }
 
 async function sealBid(){
@@ -341,9 +397,14 @@ function renderInner(){
       if(st.buyers===0) status('WAITING FOR BUYERS TO JOIN');
     }
     if(phase==='offer'&&st.winner_seat>=0){
-      key('ACCEPT',()=>send({type:'settle',ok:true}),'go');
+      key('ACCEPT',()=>{ myNet+=st.price_ct;
+        send({type:'settle',ok:true,price_ct:st.price_ct}); },'go');
       key('DECLINE',()=>send({type:'settle',ok:false}),'no');
     }
+    // Enough trades have settled to audit the books in aggregate.
+    if(st.epoch==='ready') key('CLEAR EPOCH', epochStart, 'go');
+    if(st.epoch==='done')  key('NEW EPOCH', ()=>{ myNet=0; myWins=[];
+        send({type:'newepoch'}); });
   }else if(role==='buyer'){
     if(phase==='bidding'){
       key('BID −',()=>{myBid=Math.max(0.25,+(myBid-0.25).toFixed(2));render();});
@@ -353,15 +414,30 @@ function renderInner(){
     }
   }
 
+  // epoch heading carries the audit state
+  const ep=st.epoch, done=(st.trades||[]).length;
+  $('loghead').innerHTML = ep==='done'
+    ? (st.epoch_ok
+        ? `EPOCH AUDITED · BOOKS BALANCE · NET ${st.epoch_net.toFixed(2)} CT`
+        : `EPOCH AUDITED · IMBALANCE ${st.epoch_net.toFixed(2)} CT`)
+    : ep==='audit' ? `EPOCH AUDIT · ${st.epoch_have} OF ${(st.peers||[]).length} TOTALS SEALED`
+    : `SETTLED TRADES · ${done} OF ${st.epoch_size}`;
+
   // trade log
   const tb=$('tlog');
   if(!st.trades||!st.trades.length){ tb.innerHTML='<tr><td class="empty">NONE YET</td></tr>'; }
   else{
-    tb.innerHTML=st.trades.map(t=>
-      `<tr><td>${t.at}</td><td>H${String(t.hour).padStart(2,'0')}</td>`+
-      `<td>BUYER ${t.seat+1}</td><td>${t.price_ct.toFixed(2)} CT</td>`+
-      `<td>${t.bidders} BIDS</td>`+
-      `<td class="${t.accepted?'ok':'no'}">${t.accepted?'CLEARED':'DECLINED'}</td></tr>`).join('');
+    // No winner column: the log names nobody. A tab marks its own rows
+    // because it was told privately, not because the log says so.
+    const n=st.trades.length;
+    tb.innerHTML=st.trades.map((t,i)=>{
+      const mine=myWins.includes(n-1-i);
+      return `<tr><td>${t.at}</td><td>SLOT ${String(t.slot).padStart(2,'0')}:00</td>`+
+      `<td>${t.price_ct.toFixed(2)} CT</td>`+
+      `<td>${t.bidders} SEALED BIDS</td>`+
+      `<td class="${t.accepted?'ok':'no'}">${t.accepted?'CLEARED':'DECLINED'}</td>`+
+      `<td>${mine?'YOU':'&nbsp;'}</td></tr>`;
+    }).join('');
   }
 }
 function seatSealed(){ const p=(st?.peers||[]).find(x=>x.id===me); return !!(p&&p.sealed); }

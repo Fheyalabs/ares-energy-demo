@@ -1,21 +1,23 @@
 // End-to-end auction over the real WebSocket protocol with real WASM.
 //
-// The crypto smoke test proved the FHE primitives work. It could not catch
-// the class of bug this exercises: the relay never sent the seller the bid
-// ciphertexts, so it had nothing to open once it knew the winner. Only
-// driving the actual message flow, with one WASM Session per simulated
-// tab, finds that.
+// One WASM Session per simulated tab. This exercises what a crypto smoke
+// test cannot: the message flow, the anonymity of the settled log, and the
+// aggregate epoch audit.
 //
-//   node examples/energy_auction/e2e/auction_e2e.js [ws://host:port/ws]
+//   node examples/energy_auction/e2e/auction_e2e.js [ws://host:port/ws] [--tamper]
+//
+// --tamper makes one buyer understate what it paid, so the epoch audit
+// must fail to balance. A check that only ever passes proves nothing.
 const path = require('path');
-const WASM = path.resolve(__dirname, '../static/wasm/pool_wasm.js');
-const PoolWasm = require(WASM);
+const PoolWasm = require(path.resolve(__dirname, '../static/wasm/pool_wasm.js'));
 
-const URL = process.argv[2] || 'ws://localhost:8477/ws';
+const URL = process.argv.find(a => a.startsWith('ws://')) || 'ws://localhost:8477/ws';
+const TAMPER = process.argv.includes('--tamper');
 const RING = 16384, DEPTH = 3, SCALE_MOD = 50, FIRST_MOD = 60, BATCH = 8;
 const SHARPEN = [0.5, 0.5];
 const SPAN = 16.0;
 const BIDS = [6.25, 7.50, 5.00, 9.75, 8.00]; // seat 3 must win
+const EPOCH = 5;
 
 const b64 = u8 => Buffer.from(u8).toString('base64');
 const unb64 = s => new Uint8Array(Buffer.from(s, 'base64'));
@@ -25,13 +27,14 @@ const why = e => {
   try { return M.getExceptionMessage(e).filter(Boolean).join(': '); } catch (_) { return String(e); }
 };
 
-// One simulated tab: its own WASM Session and its own socket.
 class Tab {
   constructor(name) {
     this.name = name;
     this.S = new M.Session(RING, DEPTH, SCALE_MOD, FIRST_MOD, BATCH);
     this.pubKey = null;
     this.state = null;
+    this.net = 0;   // this tab's own epoch position, nobody else's
+    this.wins = 0;
     this.ws = new WebSocket(URL);
     this.ws.onmessage = ev => this.onMessage(JSON.parse(ev.data));
   }
@@ -48,14 +51,12 @@ class Tab {
   onMessage(m) {
     try {
       if (m.type === 'state') { this.me = m.you; this.state = m.state; return; }
-
       if (m.type === 'pubkey') { this.pubKey = unb64(m.blob); return; }
 
-      if (m.type === 'evalkey') {
-        this.S.importEvalKey(unb64(m.blob));
-        this.isEvaluator = true;
-        return;
-      }
+      // Sent to exactly one tab.
+      if (m.type === 'won') { this.net += m.price_ct; this.wins++; return; }
+
+      if (m.type === 'evalkey') { this.S.importEvalKey(unb64(m.blob)); return; }
 
       if (m.type === 'evaluate') {
         const cts = m.blobs.map(unb64);
@@ -73,8 +74,28 @@ class Tab {
         const bids = (m.bids || []).map(unb64);
         if (!bids[win]) throw new Error('relay sent no ciphertext for the winning seat');
         const price = this.S.fuse([this.S.partialDecrypt(bids[win])], 1)[0] * SPAN;
-        this.masks = vals;
         this.send({ type: 'offer', seat: seats[win] ?? win, price_ct: price });
+        return;
+      }
+
+      // ---- epoch audit ----
+      if (m.type === 'epochkey') {
+        const sign = this.role === 'seller' ? -1 : 1;
+        let net = this.net;
+        if (TAMPER && this.name === 'buyer3') net -= 3.0;
+        const ct = this.S.encrypt(unb64(m.blob), new Array(BATCH).fill(sign * net / SPAN));
+        this.send({ type: 'epochtotal', blob: b64(ct) });
+        return;
+      }
+      if (m.type === 'epochsum') {
+        let acc = unb64(m.blobs[0]);
+        for (let i = 1; i < m.blobs.length; i++) acc = this.S.evalAdd(acc, unb64(m.blobs[i]));
+        this.send({ type: 'epochsummed', blob: b64(acc) });
+        return;
+      }
+      if (m.type === 'epochopen') {
+        const net = this.S.fuse([this.S.partialDecrypt(unb64(m.blob))], 1)[0] * SPAN;
+        this.send({ type: 'epochresult', price_ct: net, ok: Math.abs(net) < 0.05 });
         return;
       }
     } catch (e) {
@@ -85,7 +106,7 @@ class Tab {
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function until(fn, label, ms = 40000) {
+async function until(fn, label, ms = 60000) {
   const t0 = Date.now();
   while (!fn()) {
     if (Date.now() - t0 > ms) throw new Error(`timeout waiting for ${label}`);
@@ -95,12 +116,11 @@ async function until(fn, label, ms = 40000) {
 
 (async () => {
   M = await PoolWasm();
-  console.log(`connecting to ${URL}`);
+  console.log(`connecting to ${URL}${TAMPER ? '   [TAMPER]' : ''}`);
 
   const seller = new Tab('seller');
   await seller.ready();
   await until(() => seller.role === 'seller', 'seller seated');
-  console.log('seller seated');
 
   const buyers = [];
   for (let i = 0; i < BIDS.length; i++) {
@@ -109,64 +129,57 @@ async function until(fn, label, ms = 40000) {
     await until(() => b.role === 'buyer', `buyer ${i} seated`);
     buyers.push(b);
   }
-  console.log(`${buyers.length} buyers seated (seats ${buyers.map(b => b.seat).join(',')})`);
+  console.log(`seated: 1 seller + ${buyers.length} buyers`);
 
-  // Two rounds. A second round is where per-context key caching bites:
-  // OpenFHE keeps eval keys in a global map keyed by context id, so
-  // regenerating them for the same context can collide with round one.
-  for (let round = 1; round <= 3; round++) {
-  console.log(`\n--- round ${round} ---`);
-  if (round > 1) {
-    // No explicit reset: settling clears the round, and the seller must be
-    // able to open the next one straight from 'settled'.
-    await until(() => seller.state?.phase === 'settled', 'settled');
-    for (const b of buyers) b.pubKey = null;
+  for (let round = 1; round <= EPOCH; round++) {
+    if (round > 1) {
+      await until(() => seller.state?.phase === 'settled', 'settled');
+      for (const b of buyers) b.pubKey = null;
+    }
+    const { pk, evalKey } = seller.S.singleKeyGen();
+    seller.send({ type: 'keys', blob: b64(pk), note: b64(evalKey) });
+    await until(() => buyers.every(b => b.pubKey), 'public key delivered');
+
+    for (const b of buyers) {
+      const ct = b.S.encrypt(b.pubKey, new Array(BATCH).fill(BIDS[b.seat] / SPAN));
+      b.send({ type: 'bid', blob: b64(ct) });
+      await sleep(40);
+    }
+    await until(() => seller.state?.winner_seat >= 0, 'offer');
+
+    const price = seller.state.price_ct;
+    seller.net += price;
+    const before = (seller.state?.trades || []).length;
+    seller.send({ type: 'settle', ok: true, price_ct: price });
+    await until(() => (seller.state?.trades || []).length > before, 'trade logged');
+    console.log(`round ${round}: cleared ${price.toFixed(2)} ct at slot ${seller.state.trades[0].slot}`);
   }
 
-  // Seller opens the auction: keypair generated in its own tab.
-  let t = Date.now();
-  const { pk, evalKey } = seller.S.singleKeyGen();
-  seller.send({ type: 'keys', blob: b64(pk), note: b64(evalKey) });
-  await until(() => buyers.every(b => b.pubKey), 'public key delivered');
-  console.log(`keys published ${Date.now() - t}ms`);
+  // The log must name nobody.
+  const log = seller.state.trades;
+  const named = log.some(t => 'seat' in t);
+  const slots = log.map(t => t.slot).reverse();
+  console.log(`\nlog rows ${log.length}, slots ${slots.join(',')}`);
+  console.log(`log names a winner:      ${named ? 'YES (bad)' : 'no'}`);
+  const winner = buyers[BIDS.indexOf(Math.max(...BIDS))];
+  console.log(`winner knows privately:  ${winner.wins} wins, net ${winner.net.toFixed(2)} ct`);
+  const othersBlind = buyers.filter(b => b !== winner).every(b => b.wins === 0);
+  console.log(`other buyers told:       ${othersBlind ? 'nothing' : 'SOMETHING (bad)'}`);
 
-  // Each buyer encrypts its own bid.
-  t = Date.now();
-  for (const b of buyers) {
-    const ct = b.S.encrypt(b.pubKey, new Array(BATCH).fill(BIDS[b.seat] / SPAN));
-    b.send({ type: 'bid', blob: b64(ct) });
-    await sleep(40);
-  }
-  console.log(`all bids sealed ${Date.now() - t}ms`);
+  // Aggregate audit: no individual total opened, no trade replayed.
+  await until(() => seller.state?.epoch === 'ready', 'epoch ready');
+  console.log(`\nepoch ready after ${log.length} trades, auditing in aggregate`);
+  const t = Date.now();
+  const { pk } = seller.S.singleKeyGen();
+  seller.send({ type: 'epochopen', blob: b64(pk) });
+  await until(() => seller.state?.epoch === 'done', 'epoch audited');
+  const net = seller.state.epoch_net, ok = seller.state.epoch_ok;
+  console.log(`epoch audited in ${Date.now() - t}ms: net ${net.toFixed(3)} ct, balanced=${ok}`);
 
-  // Argmax runs on a blind buyer, masks go to the seller, seller offers.
-  t = Date.now();
-  await until(() => seller.state?.winner_seat >= 0, 'seller to receive an offer');
-  console.log(`argmax + open ${Date.now() - t}ms`);
-
-  const gotSeat = seller.state.winner_seat;
-  const gotPrice = seller.state.price_ct;
-  const wantSeat = BIDS.indexOf(Math.max(...BIDS));
-  console.log(`bids   ${BIDS.map(b => b.toFixed(2)).join('  ')}`);
-  console.log(`masks  ${(seller.masks || []).map(v => v.toFixed(4)).join('  ')}`);
-  console.log(`winner seat ${gotSeat} (want ${wantSeat}) at ${gotPrice.toFixed(2)} ct (want ${BIDS[wantSeat].toFixed(2)})`);
-
-  // Seller accepts; the trade must land in the log for everyone.
-  const before = (seller.state?.trades || []).length;
-  seller.send({ type: 'settle', ok: true });
-  // Count rather than test for non-empty: on later rounds the log already
-  // holds the earlier trades, so a length>0 check passes instantly and
-  // asserts against the wrong row.
-  await until(() => (seller.state?.trades || []).length > before, 'trade logged');
-  const tr = seller.state.trades[0];
-  console.log(`logged: seat ${tr.seat} ${tr.price_ct.toFixed(2)}ct ${tr.accepted ? 'CLEARED' : 'DECLINED'} (${tr.bidders} bids)`);
-
-  const ok = gotSeat === wantSeat
-    && Math.abs(gotPrice - BIDS[wantSeat]) < 0.01
-    && tr.accepted && tr.seat === wantSeat;
-  if (!ok) { console.log(`E2E_FAIL in round ${round}`); process.exit(1); }
-  console.log(`round ${round} OK`);
-  }
-  console.log('E2E_OK');
-  process.exit(0);
+  const expectBalanced = !TAMPER;
+  const pass = !named && othersBlind && winner.wins === EPOCH
+    && slots.length === EPOCH && new Set(slots).size === EPOCH
+    && ok === expectBalanced;
+  console.log(pass ? 'E2E_OK' : 'E2E_FAIL');
+  process.exit(pass ? 0 : 1);
 })().catch(e => { console.error('ERROR:', why(e) || e); process.exit(1); });

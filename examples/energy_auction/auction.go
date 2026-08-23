@@ -43,15 +43,36 @@ type Peer struct {
 	Sealed bool   `json:"sealed"` // has submitted a bid ciphertext
 }
 
-// Trade is one settled auction, for the log.
+// Trade is one settled auction, as it appears in the public log.
+//
+// The winning seat is deliberately NOT serialised. Broadcasting it would
+// contradict the property the auction exists to demonstrate: in ARES only
+// the winner learns it won. The seat is kept unexported so the relay can
+// tell that one tab privately, and every other tab sees a settled trade
+// with a price and no name attached.
 type Trade struct {
 	At       string  `json:"at"`
-	Hour     int     `json:"hour"`
+	Slot     int     `json:"slot"`
 	PriceCt  float64 `json:"price_ct"`
-	Seat     int     `json:"seat"`
 	Accepted bool    `json:"accepted"`
 	Bidders  int     `json:"bidders"`
+
+	seat int // never marshalled
 }
+
+// EpochSize is how many settled trades close an epoch. At that point the
+// books are audited in aggregate rather than trade by trade.
+const EpochSize = 5
+
+// EpochPhase tracks the aggregate audit.
+type EpochPhase string
+
+const (
+	EpochOpen  EpochPhase = "open"  // still collecting trades
+	EpochReady EpochPhase = "ready" // enough trades; audit can be run
+	EpochAudit EpochPhase = "audit" // participants submitting encrypted totals
+	EpochDone  EpochPhase = "done"  // aggregate opened
+)
 
 // Auction is the whole demo state. The server holds ciphertexts and
 // routes them; it holds no key material and performs no cryptography.
@@ -74,15 +95,26 @@ type Auction struct {
 	priceCt    float64
 
 	trades []Trade
+
+	// Epoch audit. Totals are encrypted per participant and summed
+	// homomorphically; only the sum is ever opened.
+	epoch       EpochPhase
+	epochKey    []byte
+	epochTotals map[string][]byte
+	epochNet    float64
+	epochOK     bool
+	epochOpened bool
 }
 
 func NewAuction() *Auction {
 	return &Auction{
-		Hour:       13,
-		phase:      PhaseWaiting,
-		peers:      map[string]*Peer{},
-		bids:       map[int][]byte{},
-		winnerSeat: -1,
+		Hour:        13,
+		phase:       PhaseWaiting,
+		peers:       map[string]*Peer{},
+		bids:        map[int][]byte{},
+		winnerSeat:  -1,
+		epoch:       EpochOpen,
+		epochTotals: map[string][]byte{},
 	}
 }
 
@@ -247,32 +279,102 @@ func (a *Auction) Offer(seat int, price float64) {
 }
 
 // Settle logs the seller's decision and ends the round.
-func (a *Auction) Settle(accepted bool) {
+//
+// Returns the winning seat so the caller can tell that one buyer,
+// privately, that it won. Nobody else is told: the public log carries a
+// price and no name.
+func (a *Auction) Settle(accepted bool) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.winnerSeat < 0 {
-		return
+		return -1
 	}
+	seat := a.winnerSeat
 	a.trades = append([]Trade{{
 		At:       time.Now().Format("15:04:05"),
-		Hour:     a.Hour,
+		Slot:     a.Hour,
 		PriceCt:  a.priceCt,
-		Seat:     a.winnerSeat,
 		Accepted: accepted,
 		Bidders:  len(a.bids),
+		seat:     seat,
 	}}, a.trades...)
-	if len(a.trades) > 8 {
-		a.trades = a.trades[:8]
-	}
 
-	// Clear the round's crypto state as part of settling rather than
-	// waiting for an explicit reset. The keys and ciphertexts belong to
-	// the round that just ended; leaving them in place invites a second
-	// round to run against stale material. The trade log survives.
+	// Each trade in an epoch clears the next delivery slot, so the log
+	// reads as a sequence of hours rather than the same one repeatedly.
+	a.Hour = (a.Hour + 1) % 24
+
 	trades := a.trades
 	a.resetLocked()
 	a.trades = trades
 	a.phase = PhaseSettled
+
+	if a.epoch == EpochOpen && len(a.trades) >= EpochSize {
+		a.epoch = EpochReady
+	}
+	return seat
+}
+
+// OpenEpochAudit publishes a fresh key for the aggregate audit and starts
+// collecting encrypted per-participant totals.
+func (a *Auction) OpenEpochAudit(key []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.epochKey = key
+	a.epochTotals = map[string][]byte{}
+	a.epoch = EpochAudit
+	a.epochOpened = false
+}
+
+// SubmitEpochTotal stores one participant's encrypted net position for the
+// epoch. Returns true once every seated tab has submitted.
+func (a *Auction) SubmitEpochTotal(id string, ct []byte) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.epoch != EpochAudit {
+		return false
+	}
+	a.epochTotals[id] = ct
+	return len(a.epochTotals) >= len(a.peers)
+}
+
+// EpochCiphertexts returns the encrypted totals to be summed. Only their
+// sum is ever opened; no individual total is decrypted.
+func (a *Auction) EpochCiphertexts() [][]byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([][]byte, 0, len(a.epochTotals))
+	for _, id := range a.order {
+		if ct, ok := a.epochTotals[id]; ok {
+			out = append(out, ct)
+		}
+	}
+	return out
+}
+
+// CloseEpoch records the opened aggregate. net is the sum of every
+// participant's signed position: buyers positive, seller negative. The
+// books balance when it is zero.
+func (a *Auction) CloseEpoch(net float64, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.epochNet = net
+	a.epochOK = ok
+	a.epochOpened = true
+	a.epoch = EpochDone
+}
+
+// NewEpoch clears the log and starts collecting again.
+func (a *Auction) NewEpoch() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.trades = nil
+	a.epoch = EpochOpen
+	a.epochKey = nil
+	a.epochTotals = map[string][]byte{}
+	a.epochNet = 0
+	a.epochOK = false
+	a.epochOpened = false
+	a.resetLocked()
 }
 
 // Snapshot is what every tab renders from. Ciphertexts are deliberately
@@ -304,6 +406,12 @@ func (a *Auction) Snapshot() map[string]any {
 		"price_ct":    a.priceCt,
 		"trades":      a.trades,
 		"has_keys":    len(a.pubKey) > 0,
+		"epoch":       a.epoch,
+		"epoch_size":  EpochSize,
+		"epoch_net":   a.epochNet,
+		"epoch_ok":    a.epochOK,
+		"epoch_open":  a.epochOpened,
+		"epoch_have":  len(a.epochTotals),
 	}
 }
 
@@ -326,6 +434,19 @@ func (a *Auction) SellerID() string {
 	defer a.mu.Unlock()
 	if p := a.seller(); p != nil {
 		return p.ID
+	}
+	return ""
+}
+
+// PeerAtSeat returns the connection id of the buyer in a seat, so the
+// relay can tell exactly one tab that it won.
+func (a *Auction) PeerAtSeat(seat int) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, p := range a.peers {
+		if p.Role == RoleBuyer && p.Seat == seat {
+			return p.ID
+		}
 	}
 	return ""
 }
