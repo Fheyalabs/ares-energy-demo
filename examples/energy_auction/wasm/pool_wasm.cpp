@@ -73,6 +73,7 @@ public:
                        "CreateCKKSContext");
     }
     ~Session() {
+        if (sk_) FreeSecretKeyShare(sk_);
         if (ctx_) FreeCryptoContext(ctx_);
     }
 
@@ -86,7 +87,7 @@ public:
         PublicKeyHandle pk = nullptr;
         SecretKeyShareHandle sk = nullptr;
         must(KeyGenFirst(ctx_, &pk, &sk), "KeyGenFirst");
-        sk_ = sk;
+        setShare(sk);
         return toVal(serializePK(pk));
     }
 
@@ -97,8 +98,10 @@ public:
             "DeserializePublicKey");
         PublicKeyHandle pk = nullptr;
         SecretKeyShareHandle sk = nullptr;
-        must(KeyGenNext(ctx_, prev, &pk, &sk), "KeyGenNext");
-        sk_ = sk;
+        int rc = KeyGenNext(ctx_, prev, &pk, &sk);
+        FreePublicKey(prev);
+        must(rc, "KeyGenNext");
+        setShare(sk);
         return toVal(serializePK(pk));
     }
 
@@ -111,9 +114,9 @@ public:
         PublicKeyHandle pk = notNull(
             DeserializePublicKey(ctx_, jointPK.data(), jointPK.size()),
             "DeserializePublicKey");
-        CiphertextHandle ct = notNull(
-            Encrypt(ctx_, pk, vals.data(), static_cast<int>(vals.size())), "Encrypt");
-        return toVal(serializeCT(ct));
+        CiphertextHandle ct = Encrypt(ctx_, pk, vals.data(), static_cast<int>(vals.size()));
+        FreePublicKey(pk);
+        return toVal(serializeCT(notNull(ct, "Encrypt")));
     }
 
     // ---- single-key auction (the cabs trust model) -------------------
@@ -127,7 +130,7 @@ public:
         PublicKeyHandle pk = nullptr;
         SecretKeyShareHandle sk = nullptr;
         must(KeyGenFirst(ctx_, &pk, &sk), "KeyGenFirst");
-        sk_ = sk;
+        setShare(sk);
         EvalMultKeyHandle ek = nullptr;
         must(SingleKeyEvalMultKeyGenWithOutput(ctx_, sk, &ek),
              "SingleKeyEvalMultKeyGen");
@@ -173,7 +176,10 @@ public:
                             coeffs.data(), static_cast<int>(coeffs.size()),
                             masks.data());
         for (auto h : in) FreeCiphertext(h);
-        must(rc, "EvalArgmax");
+        if (rc != 0) {
+            for (auto h : masks) if (h) FreeCiphertext(h);
+            must(rc, "EvalArgmax");
+        }
 
         val arr = val::array();
         for (unsigned i = 0; i < n; ++i) arr.set(i, toVal(serializeCT(masks[i])));
@@ -302,11 +308,23 @@ private:
         return takeBuffer(data, len);
     }
 
+    // Takes ownership of pk, mirroring serializeCT. Every caller hands over
+    // a freshly generated key it does not reuse; without the free, one
+    // public key stays in the WASM heap per keygen.
     Bytes serializePK(PublicKeyHandle pk) {
         uint8_t* data = nullptr;
         size_t len = 0;
-        must(SerializePublicKey(pk, &data, &len), "SerializePublicKey");
+        int rc = SerializePublicKey(pk, &data, &len);
+        FreePublicKey(pk);
+        must(rc, "SerializePublicKey");
         return takeBuffer(data, len);
+    }
+
+    // The seller re-keys the same Session every round, so replacing the
+    // share has to release the one it displaces.
+    void setShare(SecretKeyShareHandle sk) {
+        if (sk_) FreeSecretKeyShare(sk_);
+        sk_ = sk;
     }
 
     CryptoContextHandle ctx_ = nullptr;

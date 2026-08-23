@@ -29,10 +29,12 @@ const why = e => {
 };
 
 class Tab {
-  constructor(name) {
+  constructor(name, mod) {
     this.name = name;
-    this.S = new M.Session(RING, DEPTH, SCALE_MOD, FIRST_MOD, BATCH);
+    this.M = mod;                 // this tab's own WASM instance
+    this.S = new mod.Session(RING, DEPTH, SCALE_MOD, FIRST_MOD, BATCH);
     this.pubKey = null;
+    this.pubKeyID = 0;
     this.state = null;
     this.net = 0;   // this tab's own epoch position, nobody else's
     this.wins = 0;
@@ -48,24 +50,30 @@ class Tab {
   }
   send(o) { this.ws.send(JSON.stringify(o)); }
   epoch() {
-    if (!this.epochS) this.epochS = new M.Session(RING, DEPTH, SCALE_MOD, FIRST_MOD, BATCH);
+    if (!this.epochS) this.epochS = new this.M.Session(RING, DEPTH, SCALE_MOD, FIRST_MOD, BATCH);
     return this.epochS;
   }
+  // A key is usable only if it is the one the relay is currently running.
+  keyReady() { return !!this.pubKey && this.state?.key_id > 0 && this.pubKeyID === this.state.key_id; }
   get role() { return (this.state?.peers || []).find(p => p.id === this.me)?.role || ''; }
   get seat() { return (this.state?.peers || []).find(p => p.id === this.me)?.seat ?? -1; }
 
   onMessage(m) {
     try {
-      if (m.type === 'state') {
-        this.me = m.you; this.state = m.state;
-        // Same invariant as the browser: a stale public key must never
-        // survive into the next round.
-        if (!this.state.has_keys) this.pubKey = null;
+      if (m.type === 'state') { this.me = m.you; this.state = m.state; return; }
+      if (m.type === 'pubkey') {
+        this.pubKey = unb64(m.blob); this.pubKeyID = m.key_id || 0; return;
+      }
+      if (m.type === 'bidrejected') {
+        this.rejected = (this.rejected || 0) + 1;
+        this.needReseal = true;              // re-seal once the live key lands
         return;
       }
-      if (m.type === 'pubkey') { this.pubKey = unb64(m.blob); return; }
       if (m.type === 'epochreset') {
-        this.net = 0; this.wins = 0; this.epochS = null; this.verified = undefined;
+        this.net = 0; this.wins = 0; this.verified = undefined;
+        // embind objects need an explicit delete; dropping the handle
+        // leaks the C++ context and keys inside the WASM heap.
+        if (this.epochS) { try { this.epochS.delete(); } catch (_) {} this.epochS = null; }
         return;
       }
 
@@ -130,7 +138,9 @@ class Tab {
         return;
       }
     } catch (e) {
-      console.error(`${this.name}: ${why(e)}`);
+      let msg = String(e);
+      try { msg = this.M.getExceptionMessage(e).filter(Boolean).join(': '); } catch (_) {}
+      console.error(`${this.name}: ${msg}`);
       process.exitCode = 1;
     }
   }
@@ -149,31 +159,43 @@ async function until(fn, label, ms = 60000) {
   M = await PoolWasm();
   console.log(`connecting to ${URL}${TAMPER ? '   [TAMPER]' : ''}`);
 
-  const seller = new Tab('seller');
+  const seller = new Tab('seller', await PoolWasm());
   await seller.ready();
   await until(() => seller.role === 'seller', 'seller seated');
 
   const buyers = [];
   for (let i = 0; i < BIDS.length; i++) {
-    const b = new Tab(`buyer${i}`);
+    const b = new Tab(`buyer${i}`, await PoolWasm());
     await b.ready();
     await until(() => b.role === 'buyer', `buyer ${i} seated`);
     buyers.push(b);
   }
   console.log(`seated: 1 seller + ${buyers.length} buyers`);
 
+  let lastKeyID = 0;
 for (let ep = 1; ep <= EPOCHS; ep++) {
   console.log(`\n=== epoch ${ep} ===`);
   for (let round = 1; round <= EPOCH; round++) {
     if (round > 1) await until(() => seller.state?.phase === 'settled', 'settled');
-    await until(() => buyers.every(b => !b.pubKey), 'stale keys cleared');
     const { pk, evalKey } = seller.S.singleKeyGen();
     seller.send({ type: 'keys', blob: b64(pk), note: b64(evalKey) });
-    await until(() => buyers.every(b => b.pubKey), 'public key delivered');
+    await until(() => buyers.every(b => b.keyReady() && b.pubKeyID > lastKeyID),
+      'this round\'s key delivered');
+    lastKeyID = buyers[0].pubKeyID;
 
     for (const b of buyers) {
       const ct = b.S.encrypt(b.pubKey, new Array(BATCH).fill(BIDS[b.seat] / SPAN));
-      b.send({ type: 'bid', blob: b64(ct) });
+      b.send({ type: 'bid', blob: b64(ct), key_id: b.pubKeyID });
+      await sleep(40);
+    }
+    // Any buyer whose bid was refused as stale re-seals under the key the
+    // relay is actually running. Without this the round strands.
+    for (const b of buyers) {
+      if (!b.needReseal) continue;
+      await until(() => b.keyReady(), 'live key for reseal');
+      b.needReseal = false;
+      const ct = b.S.encrypt(b.pubKey, new Array(BATCH).fill(BIDS[b.seat] / SPAN));
+      b.send({ type: 'bid', blob: b64(ct), key_id: b.pubKeyID });
       await sleep(40);
     }
     await until(() => seller.state?.winner_seat >= 0, 'offer');
@@ -221,6 +243,9 @@ for (let ep = 1; ep <= EPOCHS; ep++) {
     x.verified !== undefined && Math.abs(x.verified - net) < 0.05);
   console.log(`all ${1 + buyers.length} tabs verified independently: ${allAgree ? 'yes' : 'NO (bad)'}`);
 
+  const rejected = [seller, ...buyers].reduce((n, x) => n + (x.rejected || 0), 0);
+  console.log(`bids rejected as stale:  ${rejected}`);
+
   const expectBalanced = !TAMPER;
   const pass = !named && othersBlind && winner.wins === EPOCH
     && slots.length === EPOCH && new Set(slots).size === EPOCH
@@ -238,4 +263,8 @@ for (let ep = 1; ep <= EPOCHS; ep++) {
 }
   console.log('\nE2E_OK');
   process.exit(0);
-})().catch(e => { console.error('ERROR:', why(e) || e); process.exit(1); });
+})().catch(e => {
+  console.error('ERROR:', why(e) || e);
+  if (e && e.stack) console.error(e.stack);
+  process.exit(1);
+});

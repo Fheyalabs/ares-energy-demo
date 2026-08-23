@@ -195,7 +195,7 @@ const FHE = {
 
 /* ---------- state ---------- */
 const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-let me=null, st=null, myBid=8.00, pubKey=null, epochKey=null;
+let me=null, st=null, myBid=8.00, pubKey=null, pubKeyID=0, resealPending=false, epochKey=null;
 
 // The epoch audit runs on its OWN context and its OWN key share, kept
 // apart from the auction key. The auction key is single-key by design:
@@ -206,6 +206,13 @@ let epochS=null;
 function epochSession(){
   if(!epochS) epochS=new FHE.M.Session(RING,DEPTH,SCALE_MOD,FIRST_MOD,BATCH);
   return epochS;
+}
+// embind objects are NOT garbage collected: dropping the JS handle leaks
+// the C++ CryptoContext and its keys inside the WASM heap. At ring 16384
+// that is megabytes per epoch, which is why the first epoch worked and
+// later ones failed.
+function freeEpochSession(){
+  if(epochS){ try{ epochS.delete(); }catch(_){} epochS=null; }
 }
 
 // Each tab keeps only its OWN epoch position. A buyer adds what it paid on
@@ -218,23 +225,26 @@ const status=s=>$('status').textContent=s;
 
 ws.onmessage=async e=>{
   const m=JSON.parse(e.data);
-  if(m.type==='state'){
-    me=m.you; st=m.state;
-    // The seller's key is only valid while the relay says a round is
-    // keyed. Tying the local copy to that removes any dependence on
-    // message ordering: without it a buyer can seal under the previous
-    // round's key, which the seller no longer holds a secret for.
-    if(!st.has_keys) pubKey=null;
-    render(); return;
-  }
+  if(m.type==='state'){ me=m.you; st=m.state; render(); return; }
   if(!FHE.ready) return;
 
   try{
-    if(m.type==='pubkey'){ pubKey=unb64(m.blob); render(); return; }
+    if(m.type==='pubkey'){
+      pubKey=unb64(m.blob); pubKeyID=m.key_id||0;
+      if(resealPending){ resealPending=false; sealBid(); }
+      render(); return;
+    }
+    if(m.type==='bidrejected'){
+      // The key this tab held had already been retired. Drop it and re-seal
+      // as soon as the live one arrives, so the round is not stranded by a
+      // message that lost a race.
+      pubKey=null; pubKeyID=0; resealPending=true;
+      status('KEY ROTATED, RE-SEALING'); render(); return;
+    }
 
     // Every tab clears its own ledger, key share and epoch context.
     if(m.type==='epochreset'){
-      myNet=0; myWins=[]; epochS=null; epochKey=null;
+      myNet=0; myWins=[]; epochKey=null; freeEpochSession();
       status('NEW EPOCH: LEDGER AND KEY SHARE CLEARED');
       render(); return;
     }
@@ -364,12 +374,12 @@ async function epochStart(){
 }
 
 async function sealBid(){
-  if(!pubKey){ status('WAITING FOR SELLER KEY'); return; }
+  if(!keyReady()){ status('WAITING FOR THIS ROUND\'S KEY'); return; }
   status('ENCRYPTING BID IN THIS TAB …');
   await new Promise(r=>setTimeout(r,30));
   const t=performance.now();
   const ct=FHE.S.encrypt(pubKey, new Array(BATCH).fill(myBid/SPAN));
-  send({type:'bid', blob:b64(ct)});
+  send({type:'bid', blob:b64(ct), key_id:pubKeyID});
   status(`SEALED IN ${Math.round(performance.now()-t)}MS, PLAINTEXT NEVER LEFT`);
 }
 
@@ -447,20 +457,23 @@ function renderInner(){
       key('DECLINE',()=>send({type:'settle',ok:false}),'no');
     }
     // Enough trades have settled to audit the books in aggregate.
-    if(st.epoch==='ready') key('CLEAR EPOCH', epochStart, 'go');
+    if(st.epoch==='ready'){
+      const b=key('CLEAR EPOCH', ()=>{ b.disabled=true; epochStart(); }, 'go');
+    }
     if(st.epoch==='done')  key('NEW EPOCH', ()=>send({type:'newepoch'}));
   }else if(role==='buyer'){
     if(phase==='bidding'){
       key('BID −',()=>{myBid=Math.max(0.25,+(myBid-0.25).toFixed(2));render();});
       key('BID +',()=>{myBid=Math.min(15.75,+(myBid+0.25).toFixed(2));render();});
-      const s=key('SEAL BID', sealBid); s.disabled=!pubKey||seatSealed();
+      const s=key('SEAL BID', sealBid); s.disabled=!keyReady()||seatSealed();
       if(seatSealed()) s.classList.add('lit');
     }
   }
 
   // epoch heading carries the audit state
   const ep=st.epoch, done=(st.trades||[]).length;
-  $('loghead').innerHTML = ep==='done'
+  $('loghead').innerHTML = st.epoch_abort ? `EPOCH AUDIT ABORTED · ${st.epoch_abort.toUpperCase()}`
+    : ep==='done'
     ? (st.epoch_ok
         ? `EPOCH AUDITED · BOOKS BALANCE · NET ${st.epoch_net.toFixed(2)} CT`
         : `EPOCH AUDITED · IMBALANCE ${st.epoch_net.toFixed(2)} CT`)
@@ -488,6 +501,7 @@ function renderInner(){
     }).join('');
   }
 }
+function keyReady(){ return !!pubKey && st && st.key_id>0 && pubKeyID===st.key_id; }
 function seatSealed(){ const p=(st?.peers||[]).find(x=>x.id===me); return !!(p&&p.sealed); }
 
 paint($('main'),'00.00');

@@ -90,6 +90,13 @@ type Auction struct {
 	bids    map[int][]byte
 	masks   [][]byte
 
+	// keyID increments on every PublishKeys so a tab can tell whether the
+	// public key it holds belongs to the round the relay is currently
+	// running. Connections are served concurrently, so message ordering
+	// between a broadcast and a point-to-point send is not guaranteed;
+	// an id makes staleness explicit instead of inferred.
+	keyID int
+
 	// Outcome of the current round.
 	winnerSeat int
 	priceCt    float64
@@ -111,6 +118,16 @@ type Auction struct {
 	// included, can decrypt anything under it.
 	chainPos      int
 	epochPartials map[string][]byte
+
+	// epochParty freezes the participant list when the audit starts.
+	//
+	// Without it the chain runs over the live peer list while the
+	// completion checks count the live peer map, so a tab joining,
+	// leaving or reloading mid-audit desynchronises them: the counts can
+	// be satisfied by a set of shares that does not match the key, and
+	// fusion fails. The audit is over a fixed set or it is over nothing.
+	epochParty []string
+	epochAbort string
 }
 
 func NewAuction() *Auction {
@@ -161,6 +178,21 @@ func (a *Auction) Leave(id string) {
 	// material and the ciphertexts under it are gone.
 	if p != nil && (p.Role == RoleSeller || p.Sealed) {
 		a.resetLocked()
+	}
+	// An N-of-N audit cannot complete without all N. Say so plainly
+	// rather than fusing a set of shares that cannot open the sum.
+	if a.epoch == EpochAudit {
+		for _, pid := range a.epochParty {
+			if pid == id {
+				a.epochAbort = "a participant left mid-audit"
+				a.epoch = EpochReady
+				a.epochParty = nil
+				a.epochTotals = map[string][]byte{}
+				a.epochPartials = map[string][]byte{}
+				a.chainPos = 0
+				break
+			}
+		}
 	}
 }
 
@@ -227,6 +259,7 @@ func (a *Auction) PublishKeys(pk, ek []byte) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pubKey, a.evalKey = pk, ek
+	a.keyID++
 	a.bids = map[int][]byte{}
 	a.masks = nil
 	a.winnerSeat = -1
@@ -238,20 +271,42 @@ func (a *Auction) PublishKeys(pk, ek []byte) {
 
 // SubmitBid stores one buyer's ciphertext. Returns true once every seated
 // buyer has sealed, which is when evaluation can begin.
-func (a *Auction) SubmitBid(id string, ct []byte) bool {
+// SubmitBid stores a bid only if it was sealed under the key this round
+// is actually running.
+//
+// Checking the phase is not enough. Between one round settling and the
+// next key arriving, a buyer holds the previous key AND a state snapshot
+// naming it, so the two agree and the bid looks current. Naming the key
+// in the bid closes that window without depending on message ordering,
+// which is not guaranteed: connections are served concurrently.
+// BidResult distinguishes a refused bid from an accepted one that is
+// simply waiting on the rest of the cohort. Collapsing the two into a
+// bool told four buyers out of five that their bid had been refused.
+type BidResult int
+
+const (
+	BidRejected BidResult = iota // wrong key, wrong phase, or not a buyer
+	BidStored                    // accepted; still waiting on other seats
+	BidComplete                  // accepted; every seat has now sealed
+)
+
+func (a *Auction) SubmitBid(id string, keyID int, ct []byte) BidResult {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	p, ok := a.peers[id]
 	if !ok || p.Role != RoleBuyer || a.phase != PhaseBidding {
-		return false
+		return BidRejected
+	}
+	if keyID != a.keyID {
+		return BidRejected // sealed under a key this round does not hold
 	}
 	a.bids[p.Seat] = ct
 	p.Sealed = true
 	if len(a.bids) < a.buyerCount() || a.buyerCount() == 0 {
-		return false
+		return BidStored
 	}
 	a.phase = PhaseEvaluating
-	return true
+	return BidComplete
 }
 
 // OrderedBids returns the sealed ciphertexts by seat, which is the order
@@ -327,16 +382,23 @@ func (a *Auction) Settle(accepted bool) int {
 func (a *Auction) StartEpochChain() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Idempotent: a second press while the chain is already running would
+	// restart it and mix shares from two different keys.
+	if a.epoch == EpochAudit {
+		return ""
+	}
 	a.epoch = EpochAudit
+	a.epochParty = append([]string(nil), a.order...)
+	a.epochAbort = ""
 	a.epochKey = nil
 	a.epochTotals = map[string][]byte{}
 	a.epochPartials = map[string][]byte{}
 	a.epochOpened = false
 	a.chainPos = 0
-	if len(a.order) == 0 {
+	if len(a.epochParty) == 0 {
 		return ""
 	}
-	return a.order[0]
+	return a.epochParty[0]
 }
 
 // AdvanceEpochChain folds in one peer's contribution. It returns the next
@@ -347,10 +409,10 @@ func (a *Auction) AdvanceEpochChain(pk []byte) (next string, done bool) {
 	defer a.mu.Unlock()
 	a.epochKey = pk
 	a.chainPos++
-	if a.chainPos >= len(a.order) {
+	if a.chainPos >= len(a.epochParty) {
 		return "", true
 	}
-	return a.order[a.chainPos], false
+	return a.epochParty[a.chainPos], false
 }
 
 // EpochKey is the joint public key once the chain has completed.
@@ -367,7 +429,7 @@ func (a *Auction) SubmitEpochPartial(id string, ct []byte) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.epochPartials[id] = ct
-	return len(a.epochPartials) >= len(a.peers)
+	return a.haveAllLocked(a.epochPartials)
 }
 
 // EpochPartials returns the collected decryption shares in peer order.
@@ -375,7 +437,7 @@ func (a *Auction) EpochPartials() [][]byte {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	out := make([][]byte, 0, len(a.epochPartials))
-	for _, id := range a.order {
+	for _, id := range a.epochParty {
 		if ct, ok := a.epochPartials[id]; ok {
 			out = append(out, ct)
 		}
@@ -392,7 +454,17 @@ func (a *Auction) SubmitEpochTotal(id string, ct []byte) bool {
 		return false
 	}
 	a.epochTotals[id] = ct
-	return len(a.epochTotals) >= len(a.peers)
+	return a.haveAllLocked(a.epochTotals)
+}
+
+// haveAllLocked reports whether every frozen party has contributed.
+func (a *Auction) haveAllLocked(m map[string][]byte) bool {
+	for _, id := range a.epochParty {
+		if _, ok := m[id]; !ok {
+			return false
+		}
+	}
+	return len(a.epochParty) > 0
 }
 
 // EpochCiphertexts returns the encrypted totals to be summed. Only their
@@ -401,7 +473,7 @@ func (a *Auction) EpochCiphertexts() [][]byte {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	out := make([][]byte, 0, len(a.epochTotals))
-	for _, id := range a.order {
+	for _, id := range a.epochParty {
 		if ct, ok := a.epochTotals[id]; ok {
 			out = append(out, ct)
 		}
@@ -434,6 +506,8 @@ func (a *Auction) NewEpoch() {
 	a.epochOpened = false
 	a.chainPos = 0
 	a.epochPartials = map[string][]byte{}
+	a.epochParty = nil
+	a.epochAbort = ""
 	a.resetLocked()
 }
 
@@ -466,6 +540,7 @@ func (a *Auction) Snapshot() map[string]any {
 		"price_ct":    a.priceCt,
 		"trades":      a.trades,
 		"has_keys":    len(a.pubKey) > 0,
+		"key_id":      a.keyID,
 		"epoch":       a.epoch,
 		"epoch_size":  EpochSize,
 		"epoch_net":   a.epochNet,
@@ -474,6 +549,8 @@ func (a *Auction) Snapshot() map[string]any {
 		"epoch_have":  len(a.epochTotals),
 		"epoch_chain": a.chainPos,
 		"epoch_parts": len(a.epochPartials),
+		"epoch_party": len(a.epochParty),
+		"epoch_abort": a.epochAbort,
 	}
 }
 
@@ -511,4 +588,11 @@ func (a *Auction) PeerAtSeat(seat int) string {
 		}
 	}
 	return ""
+}
+
+// KeyID is the id of the currently published round key.
+func (a *Auction) KeyID() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.keyID
 }

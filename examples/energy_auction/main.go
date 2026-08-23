@@ -35,9 +35,29 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true }, // local demo only
 }
 
+// peer wraps one websocket with the single-writer discipline gorilla
+// requires: "no more than one goroutine calls the write methods
+// concurrently."
+//
+// Every connection is served by its own goroutine, and any of them can
+// trigger a broadcast, so without this lock two goroutines interleave
+// frames on the same socket. The client then sees a truncated frame and
+// fails to parse it, which surfaces far from here as corrupted key
+// material, a failed fusion, or a round that simply never completes.
+type peer struct {
+	ws  *websocket.Conn
+	wmu sync.Mutex
+}
+
+func (p *peer) writeJSON(m msg) error {
+	p.wmu.Lock()
+	defer p.wmu.Unlock()
+	return p.ws.WriteJSON(m)
+}
+
 type hub struct {
 	mu      sync.Mutex
-	conns   map[string]*websocket.Conn
+	conns   map[string]*peer
 	order   []string
 	auction *Auction
 	nextID  int
@@ -53,6 +73,7 @@ type msg struct {
 	Seat  int      `json:"seat,omitempty"`
 	Price float64  `json:"price_ct,omitempty"`
 	Hour  int      `json:"hour,omitempty"`
+	KeyID int      `json:"key_id,omitempty"`
 	Ok    bool     `json:"ok,omitempty"`
 	You   string   `json:"you,omitempty"`
 	State any      `json:"state,omitempty"`
@@ -66,7 +87,7 @@ func (h *hub) send(id string, m msg) {
 	if c == nil {
 		return
 	}
-	if err := c.WriteJSON(m); err != nil {
+	if err := c.writeJSON(m); err != nil {
 		log.Printf("send %s: %v", id, err)
 	}
 }
@@ -89,7 +110,8 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.nextID++
 	id := "p" + strconv.Itoa(h.nextID)
-	h.conns[id] = c
+	p := &peer{ws: c}
+	h.conns[id] = p
 	h.order = append(h.order, id)
 	h.mu.Unlock()
 
@@ -129,8 +151,9 @@ func (h *hub) handle(id string, m msg) {
 	case "keys":
 		h.auction.PublishKeys([]byte(m.Blob), []byte(m.Note))
 		h.broadcast()
+		kid := h.auction.KeyID()
 		for _, pid := range h.peerIDs() {
-			h.send(pid, msg{Type: "pubkey", Blob: m.Blob})
+			h.send(pid, msg{Type: "pubkey", Blob: m.Blob, KeyID: kid})
 		}
 		if ev := h.auction.Evaluator(); ev != nil {
 			h.send(ev.ID, msg{Type: "evalkey", Blob: m.Note})
@@ -139,7 +162,14 @@ func (h *hub) handle(id string, m msg) {
 	// A buyer sealed a bid in its own tab. Once every seat has sealed,
 	// hand the whole set to the evaluator.
 	case "bid":
-		if !h.auction.SubmitBid(id, []byte(m.Blob)) {
+		switch h.auction.SubmitBid(id, m.KeyID, []byte(m.Blob)) {
+		case BidRejected:
+			// Tell the buyer so it re-seals under the current key rather
+			// than silently never appearing in the round.
+			h.send(id, msg{Type: "bidrejected", KeyID: h.auction.KeyID()})
+			h.broadcast()
+			return
+		case BidStored:
 			h.broadcast()
 			return
 		}
@@ -314,7 +344,7 @@ func main() {
 		"directory holding pool_wasm.js/.wasm")
 	flag.Parse()
 
-	h := &hub{conns: map[string]*websocket.Conn{}, auction: NewAuction()}
+	h := &hub{conns: map[string]*peer{}, auction: NewAuction()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.serveWS)
