@@ -264,6 +264,14 @@ func (a *Auction) Settle(accepted bool) {
 	if len(a.trades) > 8 {
 		a.trades = a.trades[:8]
 	}
+
+	// Clear the round's crypto state as part of settling rather than
+	// waiting for an explicit reset. The keys and ciphertexts belong to
+	// the round that just ended; leaving them in place invites a second
+	// round to run against stale material. The trade log survives.
+	trades := a.trades
+	a.resetLocked()
+	a.trades = trades
 	a.phase = PhaseSettled
 }
 

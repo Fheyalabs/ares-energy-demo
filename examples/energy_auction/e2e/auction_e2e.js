@@ -111,6 +111,18 @@ async function until(fn, label, ms = 40000) {
   }
   console.log(`${buyers.length} buyers seated (seats ${buyers.map(b => b.seat).join(',')})`);
 
+  // Two rounds. A second round is where per-context key caching bites:
+  // OpenFHE keeps eval keys in a global map keyed by context id, so
+  // regenerating them for the same context can collide with round one.
+  for (let round = 1; round <= 3; round++) {
+  console.log(`\n--- round ${round} ---`);
+  if (round > 1) {
+    // No explicit reset: settling clears the round, and the seller must be
+    // able to open the next one straight from 'settled'.
+    await until(() => seller.state?.phase === 'settled', 'settled');
+    for (const b of buyers) b.pubKey = null;
+  }
+
   // Seller opens the auction: keypair generated in its own tab.
   let t = Date.now();
   const { pk, evalKey } = seller.S.singleKeyGen();
@@ -140,14 +152,21 @@ async function until(fn, label, ms = 40000) {
   console.log(`winner seat ${gotSeat} (want ${wantSeat}) at ${gotPrice.toFixed(2)} ct (want ${BIDS[wantSeat].toFixed(2)})`);
 
   // Seller accepts; the trade must land in the log for everyone.
+  const before = (seller.state?.trades || []).length;
   seller.send({ type: 'settle', ok: true });
-  await until(() => (seller.state?.trades || []).length > 0, 'trade logged');
+  // Count rather than test for non-empty: on later rounds the log already
+  // holds the earlier trades, so a length>0 check passes instantly and
+  // asserts against the wrong row.
+  await until(() => (seller.state?.trades || []).length > before, 'trade logged');
   const tr = seller.state.trades[0];
   console.log(`logged: seat ${tr.seat} ${tr.price_ct.toFixed(2)}ct ${tr.accepted ? 'CLEARED' : 'DECLINED'} (${tr.bidders} bids)`);
 
   const ok = gotSeat === wantSeat
     && Math.abs(gotPrice - BIDS[wantSeat]) < 0.01
     && tr.accepted && tr.seat === wantSeat;
-  console.log(ok ? 'E2E_OK' : 'E2E_FAIL');
-  process.exit(ok ? 0 : 1);
+  if (!ok) { console.log(`E2E_FAIL in round ${round}`); process.exit(1); }
+  console.log(`round ${round} OK`);
+  }
+  console.log('E2E_OK');
+  process.exit(0);
 })().catch(e => { console.error('ERROR:', why(e) || e); process.exit(1); });

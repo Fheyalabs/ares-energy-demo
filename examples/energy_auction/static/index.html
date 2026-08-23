@@ -251,6 +251,14 @@ async function sealBid(){
 
 /* ---------- render ---------- */
 function render(){
+  try{ renderInner(); }
+  catch(e){
+    // A silent render failure looks exactly like 'the demo is stuck'.
+    console.error('render:', e);
+    status('UI ERROR: '+String(e.message||e).slice(0,80).toUpperCase());
+  }
+}
+function renderInner(){
   if(!st) return;
   const role=myRole(), phase=st.phase, seat=mySeat();
   const seller=role==='seller';
@@ -260,7 +268,14 @@ function render(){
   $('phase').textContent = phase.toUpperCase();
 
   // main readout
-  if(seller && st.winner_seat>=0){ paint($('main'),fmt(st.price_ct)); $('unit').textContent='OFFERED TO YOU'; }
+  const last=(st.trades||[])[0];
+  if(phase==='settled' && last){
+    paint($('main'),fmt(last.price_ct));
+    $('unit').textContent = last.accepted
+      ? (seller?'SOLD':(last.seat===seat?'YOU BOUGHT':'SOLD TO ANOTHER'))
+      : 'DECLINED';
+  }
+  else if(seller && st.winner_seat>=0){ paint($('main'),fmt(st.price_ct)); $('unit').textContent='OFFERED TO YOU'; }
   else if(!seller && st.winner_seat>=0){
     paint($('main'), st.winner_seat===seat?fmt(st.price_ct):'--.--');
     $('unit').textContent = st.winner_seat===seat?'YOU WON':'NOT YOU';
@@ -292,13 +307,18 @@ function render(){
 
   if(!FHE.ready){ key('LOADING…',()=>{}).disabled=true; }
   else if(seller){
-    if(phase==='waiting'||phase==='settled')
-      key('OPEN AUCTION', sellerStart).disabled = st.buyers===0;
+    // One control, not two. Starting a round from 'settled' used to need
+    // a separate reset first, which is an easy step to miss and leaves the
+    // seller looking stuck.
+    if(phase==='waiting'||phase==='settled'){
+      const b=key(phase==='settled'?'NEW ROUND':'START ROUND', sellerStart);
+      b.disabled = st.buyers===0;
+      if(st.buyers===0) status('WAITING FOR BUYERS TO JOIN');
+    }
     if(phase==='offer'&&st.winner_seat>=0){
       key('ACCEPT',()=>send({type:'settle',ok:true}),'go');
       key('DECLINE',()=>send({type:'settle',ok:false}),'no');
     }
-    if(phase==='settled') key('NEW ROUND',()=>send({type:'reset'}));
   }else if(role==='buyer'){
     if(phase==='bidding'){
       key('BID −',()=>{myBid=Math.max(0.25,+(myBid-0.25).toFixed(2));render();});
