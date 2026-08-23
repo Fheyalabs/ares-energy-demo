@@ -1,0 +1,110 @@
+name: openfhe
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pkg/ares/crypto/**'
+      - 'cmd/openfhe-contract-helper/**'
+      - 'examples/**'
+      - '.github/workflows/openfhe.yml'
+
+permissions:
+  contents: read
+
+# Serialize concurrent pushes to the same ref so they don't race for
+# the OpenFHE install cache key (the previous setup hit "Unable to
+# reserve cache with key ... another job may be creating this cache"
+# on parallel pushes, which silently dropped cache writes and made
+# subsequent runs cold-build OpenFHE from scratch).
+concurrency:
+  group: openfhe-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OPENFHE_PREFIX: /opt/openfhe
+  OPENFHE_VERSION: v1.5.1
+
+jobs:
+  test-with-openfhe:
+    name: build + test with OpenFHE 1.5.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake autoconf
+
+      # Cache the OpenFHE install only — a clean, OpenFHE-only prefix.
+      # The previous version cached /usr/local, which is ~2 GiB of
+      # unrelated system tools; restore alone took ~4 min.
+      # /opt/openfhe holds only the library (~200 MiB).
+      - name: Cache OpenFHE install
+        id: cache-openfhe
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OPENFHE_PREFIX }}
+          key: openfhe-${{ env.OPENFHE_VERSION }}-ubuntu-latest-v2
+          restore-keys: |
+            openfhe-${{ env.OPENFHE_VERSION }}-ubuntu-latest-
+
+      - name: Build + install OpenFHE ${{ env.OPENFHE_VERSION }}
+        if: steps.cache-openfhe.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --branch "${OPENFHE_VERSION}" --depth 1 \
+            https://github.com/openfheorg/openfhe-development.git /tmp/openfhe
+          cd /tmp/openfhe
+          mkdir build && cd build
+          cmake \
+            -DCMAKE_INSTALL_PREFIX="${OPENFHE_PREFIX}" \
+            -DBUILD_BENCHMARKS=OFF \
+            -DBUILD_UNITTESTS=OFF \
+            -DBUILD_EXAMPLES=OFF \
+            -DBUILD_EXTRAS=OFF \
+            -DWITH_OPENMP=OFF \
+            ..
+          make -j"$(nproc)"
+          sudo mkdir -p "${OPENFHE_PREFIX}"
+          sudo make install
+          # Ensure the runner user owns the prefix so actions/cache
+          # can read it without sudo at save time.
+          sudo chown -R "$(id -u):$(id -g)" "${OPENFHE_PREFIX}"
+
+      - name: Register OpenFHE with the dynamic linker
+        run: |
+          echo "${OPENFHE_PREFIX}/lib" | sudo tee /etc/ld.so.conf.d/openfhe.conf >/dev/null
+          sudo ldconfig
+
+      - name: Configure cgo to point at the OpenFHE prefix
+        run: |
+          {
+            echo "CGO_CXXFLAGS=-I${OPENFHE_PREFIX}/include/openfhe -I${OPENFHE_PREFIX}/include/openfhe/pke -I${OPENFHE_PREFIX}/include/openfhe/core -I${OPENFHE_PREFIX}/include/openfhe/cereal -I${OPENFHE_PREFIX}/include/openfhe/binfhe"
+            echo "CGO_LDFLAGS=-L${OPENFHE_PREFIX}/lib -Wl,-rpath,${OPENFHE_PREFIX}/lib"
+            echo "LD_LIBRARY_PATH=${OPENFHE_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: go vet (openfhe)
+        run: go vet -tags openfhe ./...
+
+      # -short skips the keygen amortization / RAM benchmarks (TestKeygenAmortizationProfile,
+      # TestPerPartyShareGenRAM, TestResidentCombineProfile, TestStreamedKeygenRAM,
+      # TestBOnlyTransfer). Those sweep depth-30 / ring-2^17 keygen and exhaust the hosted
+      # runner's memory, killing the step with SIGTERM (exit 143). They run in their own
+      # workflow_dispatch lane (keygen-bench.yml) on a high-RAM self-hosted runner.
+      - name: go test (openfhe)
+        run: go test -tags openfhe -short ./... -count=1 -timeout 600s
+
+      - name: openfhe-helper --version
+        run: |
+          go build -tags openfhe -o /tmp/openfhe-helper ./cmd/openfhe-contract-helper
+          /tmp/openfhe-helper --version

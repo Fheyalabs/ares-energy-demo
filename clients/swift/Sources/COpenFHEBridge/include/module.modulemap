@@ -1,0 +1,4 @@
+module COpenFHEBridge {
+    header "openfhe_wrapper.h"
+    export *
+}

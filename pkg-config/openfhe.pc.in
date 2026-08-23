@@ -1,0 +1,26 @@
+# OpenFHE pkg-config template.
+#
+# OpenFHE 1.5.x does not ship .pc files. If you want to use
+# `#cgo pkg-config` builds, copy this file, substitute @prefix@,
+# and drop it into $PKG_CONFIG_PATH:
+#
+#     sed 's|@prefix@|/usr/local|' pkg-config/openfhe.pc.in > openfhe.pc
+#     export PKG_CONFIG_PATH=$(pwd):$PKG_CONFIG_PATH
+#
+# Then in cgo:
+#
+#     #cgo pkg-config: OpenFHE
+#     #cgo CXXFLAGS: -std=c++17
+#
+# Adjust @prefix@ to your OpenFHE install root.
+
+prefix=@prefix@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: OpenFHE
+Description: Open-source Fully Homomorphic Encryption library
+Version: 1.5.1
+Cflags: -I${includedir}/openfhe -I${includedir}/openfhe/pke -I${includedir}/openfhe/core -I${includedir}/openfhe/cereal -I${includedir}/openfhe/binfhe
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lOPENFHEpke -lOPENFHEbinfhe -lOPENFHEcore

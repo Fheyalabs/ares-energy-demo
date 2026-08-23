@@ -1,0 +1,179 @@
+name: release-clients
+
+# Builds and stages the pinned OpenFHE Apple XCFramework and Android AAR
+# from clean, pinned source (see clients/native/openfhe.pin.json and
+# clients/native/android-ndk.pin.json), then independently assembles and
+# verifies them with cmd/release-artifact-gate (see
+# internal/releasebundle and clients/native/README.md's "Release-cache
+# bundle assembly and verification" section). This workflow only STAGES
+# artifacts as workflow run artifacts; it never tags, signs, publishes, or
+# creates a release, and it never writes staging output inside the
+# repository checkout.
+#
+# Manual dispatch only: a full OpenFHE cross-compile per platform/ABI is
+# expensive (see clients/native/README.md for RSS/disk/time guidance), so
+# this does not run on every push. Each dispatch builds fresh from the
+# selected ref's exact commit; workflow run artifacts from a previous
+# dispatch are never reused as input to a later one's gate.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# One release-clients run at a time per ref. Combined with the two jobs
+# below being serialized via `needs`, this keeps native builds serialized
+# end-to-end: never more than one OpenFHE cross-compile running under this
+# workflow at any moment, even though the Apple and Android jobs run on
+# independent runners and could technically overlap.
+concurrency:
+  group: release-clients-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apple-xcframework:
+    name: build OpenFHE Apple XCFramework
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and stage the pinned OpenFHE Apple XCFramework
+        run: |
+          set -euo pipefail
+          # RUNNER_TEMP is a per-job ephemeral directory outside the
+          # checkout -- exactly the "untracked, outside the repo" output
+          # directory the script requires.
+          out="${RUNNER_TEMP}/ares-core-native-staging/apple"
+          mkdir -p "${out}"
+          ./clients/native/build-apple-xcframework.sh "${out}"
+          echo "APPLE_STAGING_DIR=${out}" >> "${GITHUB_ENV}"
+
+      - name: Upload staged Apple artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openfhe-apple-xcframework
+          path: |
+            ${{ env.APPLE_STAGING_DIR }}/*.xcframework.zip
+            ${{ env.APPLE_STAGING_DIR }}/*.sbom.json
+            ${{ env.APPLE_STAGING_DIR }}/*.provenance.json
+            ${{ env.APPLE_STAGING_DIR }}/*.staging-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  android-aar:
+    name: build OpenFHE Android AAR
+    # Serialized after the Apple job rather than run in parallel; see the
+    # concurrency comment above.
+    needs: apple-xcframework
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/runner-images' ubuntu-latest ships a preinstalled Android
+      # NDK and exports ANDROID_NDK_HOME / ANDROID_NDK_LATEST_HOME. This
+      # workflow deliberately does not override it: build-android-aar.sh
+      # fails closed on its own (missing/too-old NDK, missing toolchain
+      # file) if the runner image ever stops providing one that meets
+      # clients/native/android-ndk.pin.json's minimum version.
+      - name: Build and stage the pinned OpenFHE Android AAR
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/ares-core-native-staging/android"
+          mkdir -p "${out}"
+          ./clients/native/build-android-aar.sh "${out}"
+          echo "ANDROID_STAGING_DIR=${out}" >> "${GITHUB_ENV}"
+
+      - name: Upload staged Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openfhe-android-aar
+          path: |
+            ${{ env.ANDROID_STAGING_DIR }}/*.aar
+            ${{ env.ANDROID_STAGING_DIR }}/*.sbom.json
+            ${{ env.ANDROID_STAGING_DIR }}/*.provenance.json
+            ${{ env.ANDROID_STAGING_DIR }}/*.staging-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  release-artifact-gate:
+    name: assemble and verify the clean-cache release bundle
+    # Depends on both platform jobs explicitly (android-aar already
+    # depends on apple-xcframework transitively, but listing both here
+    # keeps this job's real precondition -- both staged bundles exist --
+    # readable without having to trace the other job's `needs`).
+    needs: [apple-xcframework, android-aar]
+    # The gate invokes otool against the staged macos-arm64 archive. Keep
+    # this on a pinned macOS image so missing inspection tooling cannot
+    # silently downgrade verification to producer-metadata trust.
+    runs-on: macos-14
+    steps:
+      # A checkout of the exact same commit the two platform jobs built
+      # from (workflow_dispatch pins every job in the run to the same
+      # github.sha), used both as the -repo-root the gate reads pins and
+      # clients/swift/Package.release.swift from, and as the clean-checkout
+      # half of internal/releasebundle's "clean-cache" guarantee: the
+      # gate's own verifyCleanSourceRevision check fails closed unless this
+      # checkout's HEAD and git status exactly match what the staged
+      # artifacts recorded as ares_core_source_revision.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Both downloads target the same directory with no per-artifact
+      # subfolder (actions/download-artifact@v4 with an explicit `name`
+      # extracts directly into `path`), producing exactly the flat bundle
+      # layout internal/releasebundle.Assemble expects: both platforms'
+      # artifact/sbom/provenance/staging-manifest files side by side.
+      - name: Download staged Apple artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: openfhe-apple-xcframework
+          path: ${{ runner.temp }}/release-bundle
+
+      - name: Download staged Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: openfhe-android-aar
+          path: ${{ runner.temp }}/release-bundle
+
+      - name: Build release-artifact-gate
+        run: go build -o ${{ runner.temp }}/release-artifact-gate ./cmd/release-artifact-gate
+
+      # assemble independently recomputes every artifact/SBOM/provenance
+      # hash, cross-checks source revision and OpenFHE pin agreement
+      # between the two platform artifacts against this checkout, requires
+      # every required Apple slice / Android ABI and its expected
+      # libraries to actually be present in the archives, and scans
+      # clients/swift/Package.release.swift for local-path/environment
+      # dependency substitution -- see internal/releasebundle/assemble.go
+      # and clients/native/README.md. It writes no manifest at all if any
+      # of that fails.
+      - name: Assemble the release-cache manifest
+        run: |
+          set -euo pipefail
+          "${{ runner.temp }}/release-artifact-gate" assemble \
+            -bundle-dir="${{ runner.temp }}/release-bundle" \
+            -repo-root="${{ github.workspace }}" \
+            -out="${{ runner.temp }}/release-bundle/release-cache-manifest.json"
+
+      # verify re-assembles the same bundle from scratch a second time and
+      # requires the result to be identical to the manifest just written,
+      # so a manifest that was somehow hand-edited or written against a
+      # different bundle state between the two steps is still rejected.
+      - name: Verify the release-cache manifest
+        run: |
+          set -euo pipefail
+          "${{ runner.temp }}/release-artifact-gate" verify \
+            -manifest="${{ runner.temp }}/release-bundle/release-cache-manifest.json" \
+            -bundle-dir="${{ runner.temp }}/release-bundle" \
+            -repo-root="${{ github.workspace }}"
+
+      - name: Upload the verified release-cache manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-cache-manifest
+          path: ${{ runner.temp }}/release-bundle/release-cache-manifest.json
+          if-no-files-found: error
+          retention-days: 14

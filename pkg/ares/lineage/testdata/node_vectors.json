@@ -1,0 +1,44 @@
+[
+  {
+    "_comment": "Cross-language golden parity vectors for the lineage node contract. Python and Swift clients reproduce these values to prove they build SC-10 lineage nodes identically to Go. Contract: slot-submission node under session 'golden-session-1' / phase 'anon-g-verify'. Frozen at ARES-core v0.4.x. Do not edit expected.* fields without updating all client test suites.",
+    "name": "slot-submission-no-parents",
+    "input": {
+      "ed25519_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "session_id": "golden-session-1",
+      "phase_id": "anon-g-verify",
+      "role": "slot-submission",
+      "payload_hex": "7b22736c6f745f696e646578223a322c22736c6f745f646b5f707562223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d",
+      "parents_hex": []
+    },
+    "expected": {
+      "producer_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "payload_hash_hex": "0d044b78d5592b74ae643c3f0a5d3dd7b3b7a34191de6c634637f0322376eb9e",
+      "node_hash_hex": "974f244935d1785449c2f0874e15c879ecdf2e11e56999e35bf353f56ad484c9",
+      "signing_msg_hex": "974f244935d1785449c2f0874e15c879ecdf2e11e56999e35bf353f56ad484c900000010676f6c64656e2d73657373696f6e2d310000000d616e6f6e2d672d7665726966790000000f736c6f742d7375626d697373696f6e",
+      "signature_hex": "f2c4dcf81ac205f6dbed75178d8128fea3a7d9d4714b47a484a004a866da7432c7ef5b49d7ae6f0afa615c00bbbe8a6231a4077acab0da7b4dcaa370526d650f",
+      "algorithm": "ed25519"
+    }
+  },
+  {
+    "name": "assembled-with-parents",
+    "input": {
+      "ed25519_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "session_id": "golden-session-1",
+      "phase_id": "anon-g-verify",
+      "role": "assembled",
+      "payload_hex": "617373656d626c65642d6c6973742d6279746573",
+      "parents_hex": [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      ]
+    },
+    "expected": {
+      "producer_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+      "payload_hash_hex": "1963b8f6b9561ffc54b3a8a4cbb006cf6671883253cf13edd30805313a4db416",
+      "node_hash_hex": "0311fd4933713c0086910cbf577a0973dc14287bc71da44fa3e40809bf79b7db",
+      "signing_msg_hex": "0311fd4933713c0086910cbf577a0973dc14287bc71da44fa3e40809bf79b7db00000010676f6c64656e2d73657373696f6e2d310000000d616e6f6e2d672d76657269667900000009617373656d626c6564",
+      "signature_hex": "8547ab000f623e0cfe94d1e5f9abe7dfc5eb34789c95b2797f3d8a81d4ac74527cac375eaa9af12b16583cbde6f7f68a83ac1c918bd05f7519c0c9cb1aca9304",
+      "algorithm": "ed25519"
+    }
+  }
+]

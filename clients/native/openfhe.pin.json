@@ -1,0 +1,5 @@
+{
+  "openfhe_version": "v1.5.1",
+  "openfhe_source_url": "https://github.com/openfheorg/openfhe-development.git",
+  "openfhe_source_commit": "1306d14f8c26bb6150d3e6ad54f28dfe1007689e"
+}

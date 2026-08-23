@@ -1,0 +1,107 @@
+name: keygen-bench
+
+# Manual-only benchmark lane for threshold-CKKS keygen amortization, including the
+# heavy depth-30 / ring-2^17 worst case that needs more RAM than the GitHub-hosted
+# runners (or a 16 GB dev box) can give. Run it on a high-memory self-hosted runner.
+#
+# This NEVER runs on push/PR — ARES-core's regular CI (go.yml, openfhe.yml) stays on
+# hosted runners. This is an opt-in measurement job only.
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: "Runner label (a high-RAM, >=24 GB self-hosted runner for the heavy rows)."
+        type: string
+        default: "self-hosted"
+      heavy:
+        description: "Run the heavy ring>2^14 rows (incl. depth-30/2^17). Needs ~20 GB free RAM."
+        type: boolean
+        default: true
+      omp_threads:
+        description: "OMP_NUM_THREADS for OpenFHE (probe the concurrency effect; empty = library default)."
+        type: string
+        default: ""
+
+env:
+  OPENFHE_VERSION: v1.5.1
+  OPENFHE_PREFIX: /opt/openfhe
+
+jobs:
+  keygen-bench:
+    name: threshold-CKKS keygen amortization benchmark
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      # A persistent self-hosted runner already has OpenFHE provisioned (for the
+      # harness / app), so use it directly — don't build from source per run (the
+      # box has no build toolchain, and per-run builds are the wrong model). Detect
+      # the install prefix; fail with guidance if it's missing.
+      - name: Locate OpenFHE on the runner
+        run: |
+          set -uo pipefail
+          PREFIX=""
+          for p in /usr/local /opt/openfhe /opt/openfhe-development "$HOME/openfhe"; do
+            if ls "$p"/lib/libOPENFHEcore.so* >/dev/null 2>&1 && [ -d "$p/include/openfhe" ]; then
+              PREFIX="$p"; break
+            fi
+          done
+          if [ -z "$PREFIX" ]; then
+            LIB=$(ldconfig -p 2>/dev/null | awk '/libOPENFHEcore/{print $NF; exit}')
+            if [ -n "$LIB" ]; then
+              CAND=$(dirname "$(dirname "$LIB")")
+              [ -d "$CAND/include/openfhe" ] && PREFIX="$CAND"
+            fi
+          fi
+          if [ -z "$PREFIX" ]; then
+            echo "::error::OpenFHE 1.5.x + dev headers not found (checked /usr/local, /opt/openfhe, ldconfig)."
+            echo "Provision OpenFHE on the runner box once (lib/libOPENFHEcore.so* + include/openfhe), then re-run."
+            exit 1
+          fi
+          echo "OPENFHE_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          echo "Using OpenFHE at $PREFIX:"
+          ls -la "$PREFIX"/lib/libOPENFHEcore.so* 2>/dev/null | head -2
+
+      - name: Configure cgo + benchmark env
+        run: |
+          {
+            echo "CGO_CXXFLAGS=-I${OPENFHE_PREFIX}/include/openfhe -I${OPENFHE_PREFIX}/include/openfhe/pke -I${OPENFHE_PREFIX}/include/openfhe/core -I${OPENFHE_PREFIX}/include/openfhe/cereal -I${OPENFHE_PREFIX}/include/openfhe/binfhe"
+            echo "CGO_LDFLAGS=-L${OPENFHE_PREFIX}/lib -Wl,-rpath,${OPENFHE_PREFIX}/lib"
+            echo "LD_LIBRARY_PATH=${OPENFHE_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+            echo "ARES_FHE_ALLOW_INSECURE=1"
+            echo "ARES_BENCH_HEAVY=${{ inputs.heavy && '1' || '0' }}"
+          } >> "$GITHUB_ENV"
+          if [ -n "${{ inputs.omp_threads }}" ]; then
+            echo "OMP_NUM_THREADS=${{ inputs.omp_threads }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: free memory before benchmark
+        run: free -h || true
+
+      - name: keygen amortization profile (stage breakdown + sizes)
+        run: |
+          go test -tags openfhe -run TestKeygenAmortizationProfile -v -timeout 60m \
+            ./pkg/ares/crypto/cgo/ 2>&1 | tee /tmp/bench-profile.txt
+
+      - name: resident vs byte combine
+        run: |
+          go test -tags openfhe -run TestResidentCombineProfile -v -timeout 60m \
+            ./pkg/ares/crypto/cgo/ 2>&1 | tee /tmp/bench-resident.txt
+
+      - name: per-party share-gen RAM (incl. depth-30/2^17 worst case)
+        run: |
+          go test -tags openfhe -run TestPerPartyShareGenRAM -v -timeout 60m \
+            ./pkg/ares/crypto/cgo/ 2>&1 | tee /tmp/bench-per-party.txt
+          echo "=== peak memory after per-party run ==="; free -h || true
+
+      - name: upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keygen-bench-results
+          path: /tmp/bench-*.txt

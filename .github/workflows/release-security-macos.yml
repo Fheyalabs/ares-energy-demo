@@ -1,0 +1,51 @@
+name: release-security-macos
+
+on:
+  push:
+    paths:
+      - 'internal/releasebundle/**'
+      - 'cmd/release-artifact-gate/**'
+      - 'clients/native/**'
+      - 'internal/releaseworkflow/**'
+      - 'clients/swift/Package.release.swift'
+      - '.github/workflows/go.yml'
+      - '.github/workflows/release-clients.yml'
+      - '.github/workflows/release-security-macos.yml'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    paths:
+      - 'internal/releasebundle/**'
+      - 'cmd/release-artifact-gate/**'
+      - 'clients/native/**'
+      - 'internal/releaseworkflow/**'
+      - 'clients/swift/Package.release.swift'
+      - '.github/workflows/go.yml'
+      - '.github/workflows/release-clients.yml'
+      - '.github/workflows/release-security-macos.yml'
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: read
+
+jobs:
+  release-security:
+    name: release artifact security checks
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test release bundle, CLI, native producer, and workflow guards
+        run: |
+          GOMAXPROCS=2 go test -p=2 -race -count=1 \
+            ./internal/releasebundle \
+            ./cmd/release-artifact-gate \
+            ./clients/native \
+            ./internal/releaseworkflow

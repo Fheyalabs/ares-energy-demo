@@ -1,0 +1,43 @@
+# Built binaries
+/openfhe-contract-helper
+/auction-service
+/rideshare-service
+/cohort-service
+/bin/
+
+# Go build artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# SwiftPM build artifacts
+.build/
+.swiftpm/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local config / secrets
+*.local.yaml
+*.local.yml
+.env
+.env.*
+!.env.example
+clients/rideshareswift/.build/
