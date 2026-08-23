@@ -97,24 +97,32 @@ type Auction struct {
 	trades []Trade
 
 	// Epoch audit. Totals are encrypted per participant and summed
-	// homomorphically; only the sum is ever opened.
+	// homomorphically; only the sum is ever opened, and opening it needs
+	// every participant's share.
 	epoch       EpochPhase
 	epochKey    []byte
 	epochTotals map[string][]byte
 	epochNet    float64
 	epochOK     bool
 	epochOpened bool
+
+	// N-of-N keygen chain for the epoch key. Each peer in turn folds its
+	// share into the joint public key, so no single party, the seller
+	// included, can decrypt anything under it.
+	chainPos      int
+	epochPartials map[string][]byte
 }
 
 func NewAuction() *Auction {
 	return &Auction{
-		Hour:        13,
-		phase:       PhaseWaiting,
-		peers:       map[string]*Peer{},
-		bids:        map[int][]byte{},
-		winnerSeat:  -1,
-		epoch:       EpochOpen,
-		epochTotals: map[string][]byte{},
+		Hour:          13,
+		phase:         PhaseWaiting,
+		peers:         map[string]*Peer{},
+		bids:          map[int][]byte{},
+		winnerSeat:    -1,
+		epoch:         EpochOpen,
+		epochTotals:   map[string][]byte{},
+		epochPartials: map[string][]byte{},
 	}
 }
 
@@ -314,15 +322,65 @@ func (a *Auction) Settle(accepted bool) int {
 	return seat
 }
 
-// OpenEpochAudit publishes a fresh key for the aggregate audit and starts
-// collecting encrypted per-participant totals.
-func (a *Auction) OpenEpochAudit(key []byte) {
+// StartEpochChain begins the N-of-N keygen chain and returns the peer that
+// starts it. The chain runs through every connected tab.
+func (a *Auction) StartEpochChain() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.epochKey = key
-	a.epochTotals = map[string][]byte{}
 	a.epoch = EpochAudit
+	a.epochKey = nil
+	a.epochTotals = map[string][]byte{}
+	a.epochPartials = map[string][]byte{}
 	a.epochOpened = false
+	a.chainPos = 0
+	if len(a.order) == 0 {
+		return ""
+	}
+	return a.order[0]
+}
+
+// AdvanceEpochChain folds in one peer's contribution. It returns the next
+// peer to extend the chain, or "" with done=true when the joint key is
+// complete.
+func (a *Auction) AdvanceEpochChain(pk []byte) (next string, done bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.epochKey = pk
+	a.chainPos++
+	if a.chainPos >= len(a.order) {
+		return "", true
+	}
+	return a.order[a.chainPos], false
+}
+
+// EpochKey is the joint public key once the chain has completed.
+func (a *Auction) EpochKey() []byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.epochKey
+}
+
+// SubmitEpochPartial records one share of the threshold decryption of the
+// summed ciphertext. Returns true once every peer has contributed, which
+// is the only point at which the aggregate can be recovered.
+func (a *Auction) SubmitEpochPartial(id string, ct []byte) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.epochPartials[id] = ct
+	return len(a.epochPartials) >= len(a.peers)
+}
+
+// EpochPartials returns the collected decryption shares in peer order.
+func (a *Auction) EpochPartials() [][]byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([][]byte, 0, len(a.epochPartials))
+	for _, id := range a.order {
+		if ct, ok := a.epochPartials[id]; ok {
+			out = append(out, ct)
+		}
+	}
+	return out
 }
 
 // SubmitEpochTotal stores one participant's encrypted net position for the
@@ -374,6 +432,8 @@ func (a *Auction) NewEpoch() {
 	a.epochNet = 0
 	a.epochOK = false
 	a.epochOpened = false
+	a.chainPos = 0
+	a.epochPartials = map[string][]byte{}
 	a.resetLocked()
 }
 
@@ -412,6 +472,8 @@ func (a *Auction) Snapshot() map[string]any {
 		"epoch_ok":    a.epochOK,
 		"epoch_open":  a.epochOpened,
 		"epoch_have":  len(a.epochTotals),
+		"epoch_chain": a.chainPos,
+		"epoch_parts": len(a.epochPartials),
 	}
 }
 

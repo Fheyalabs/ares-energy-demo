@@ -35,6 +35,7 @@ class Tab {
     this.state = null;
     this.net = 0;   // this tab's own epoch position, nobody else's
     this.wins = 0;
+    this.epochS = null;   // separate context + share for the epoch audit
     this.ws = new WebSocket(URL);
     this.ws.onmessage = ev => this.onMessage(JSON.parse(ev.data));
   }
@@ -45,6 +46,10 @@ class Tab {
     });
   }
   send(o) { this.ws.send(JSON.stringify(o)); }
+  epoch() {
+    if (!this.epochS) this.epochS = new M.Session(RING, DEPTH, SCALE_MOD, FIRST_MOD, BATCH);
+    return this.epochS;
+  }
   get role() { return (this.state?.peers || []).find(p => p.id === this.me)?.role || ''; }
   get seat() { return (this.state?.peers || []).find(p => p.id === this.me)?.seat ?? -1; }
 
@@ -78,24 +83,39 @@ class Tab {
         return;
       }
 
-      // ---- epoch audit ----
+      // ---- epoch audit: N-of-N across every tab ----
+      if (m.type === 'epochchain') {
+        const S = this.epoch();
+        const pk = m.blob ? S.keyGenNext(unb64(m.blob)) : S.keyGenFirst();
+        this.send({ type: 'epochchained', blob: b64(pk) });
+        return;
+      }
       if (m.type === 'epochkey') {
         const sign = this.role === 'seller' ? -1 : 1;
         let net = this.net;
         if (TAMPER && this.name === 'buyer3') net -= 3.0;
-        const ct = this.S.encrypt(unb64(m.blob), new Array(BATCH).fill(sign * net / SPAN));
+        const ct = this.epoch().encrypt(unb64(m.blob), new Array(BATCH).fill(sign * net / SPAN));
         this.send({ type: 'epochtotal', blob: b64(ct) });
         return;
       }
       if (m.type === 'epochsum') {
         let acc = unb64(m.blobs[0]);
-        for (let i = 1; i < m.blobs.length; i++) acc = this.S.evalAdd(acc, unb64(m.blobs[i]));
+        for (let i = 1; i < m.blobs.length; i++) acc = this.epoch().evalAdd(acc, unb64(m.blobs[i]));
+        this.summed = acc;                       // kept for the one-share probe
         this.send({ type: 'epochsummed', blob: b64(acc) });
         return;
       }
-      if (m.type === 'epochopen') {
-        const net = this.S.fuse([this.S.partialDecrypt(unb64(m.blob))], 1)[0] * SPAN;
-        this.send({ type: 'epochresult', price_ct: net, ok: Math.abs(net) < 0.05 });
+      if (m.type === 'epochdecrypt') {
+        this.summed = unb64(m.blob);
+        this.send({ type: 'epochpartial', blob: b64(this.epoch().partialDecrypt(unb64(m.blob))) });
+        return;
+      }
+      if (m.type === 'epochfuse') {
+        const net = this.epoch().fuse(m.blobs.map(unb64), 1)[0] * SPAN;
+        this.verified = net;                     // every tab checks for itself
+        if (this.role === 'seller') {
+          this.send({ type: 'epochresult', price_ct: net, ok: Math.abs(net) < 0.05 });
+        }
         return;
       }
     } catch (e) {
@@ -170,16 +190,30 @@ async function until(fn, label, ms = 60000) {
   await until(() => seller.state?.epoch === 'ready', 'epoch ready');
   console.log(`\nepoch ready after ${log.length} trades, auditing in aggregate`);
   const t = Date.now();
-  const { pk } = seller.S.singleKeyGen();
-  seller.send({ type: 'epochopen', blob: b64(pk) });
+  seller.send({ type: 'epochstart' });
   await until(() => seller.state?.epoch === 'done', 'epoch audited');
   const net = seller.state.epoch_net, ok = seller.state.epoch_ok;
   console.log(`epoch audited in ${Date.now() - t}ms: net ${net.toFixed(3)} ct, balanced=${ok}`);
 
+  // The seller must NOT be able to open a total on its own. Its single
+  // share is one of six; fusing with it alone has to fail or return
+  // something that is not the aggregate.
+  let sellerAlone = 'blocked';
+  try {
+    const solo = seller.epoch().fuse([seller.epoch().partialDecrypt(seller.summed)], 1)[0] * SPAN;
+    sellerAlone = Math.abs(solo - net) < 0.05 ? 'OPENED (bad)' : 'garbage';
+  } catch (_) { sellerAlone = 'blocked'; }
+  console.log(`seller opening alone:    ${sellerAlone}`);
+
+  // Every tab reached the same figure independently.
+  const allAgree = [seller, ...buyers].every(x =>
+    x.verified !== undefined && Math.abs(x.verified - net) < 0.05);
+  console.log(`all ${1 + buyers.length} tabs verified independently: ${allAgree ? 'yes' : 'NO (bad)'}`);
+
   const expectBalanced = !TAMPER;
   const pass = !named && othersBlind && winner.wins === EPOCH
     && slots.length === EPOCH && new Set(slots).size === EPOCH
-    && ok === expectBalanced;
+    && ok === expectBalanced && sellerAlone !== 'OPENED (bad)' && allAgree;
   console.log(pass ? 'E2E_OK' : 'E2E_FAIL');
   process.exit(pass ? 0 : 1);
 })().catch(e => { console.error('ERROR:', why(e) || e); process.exit(1); });

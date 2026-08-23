@@ -197,6 +197,17 @@ const FHE = {
 const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
 let me=null, st=null, myBid=8.00, pubKey=null, epochKey=null;
 
+// The epoch audit runs on its OWN context and its OWN key share, kept
+// apart from the auction key. The auction key is single-key by design:
+// the seller holds it. The epoch key is N-of-N across every tab, so no
+// single party can open a participant's total under it, the seller
+// included.
+let epochS=null;
+function epochSession(){
+  if(!epochS) epochS=new FHE.M.Session(RING,DEPTH,SCALE_MOD,FIRST_MOD,BATCH);
+  return epochS;
+}
+
 // Each tab keeps only its OWN epoch position. A buyer adds what it paid on
 // the trades it won; the seller adds what it took in. Nobody accumulates
 // anyone else's figures, which is what makes the aggregate audit meaningful
@@ -223,36 +234,54 @@ ws.onmessage=async e=>{
     }
 
     // ---- epoch audit ----------------------------------------------
+
+    // This tab's turn to fold its share into the epoch key. The chain
+    // runs through every tab, so the finished key is N-of-N.
+    if(m.type==='epochchain'){
+      const S=epochSession();
+      const pk = m.blob ? S.keyGenNext(unb64(m.blob)) : S.keyGenFirst();
+      send({type:'epochchained', blob:b64(pk)});
+      status('FOLDED YOUR SHARE INTO THE EPOCH KEY');
+      return;
+    }
+
     if(m.type==='epochkey'){
       epochKey=unb64(m.blob);
-      // Encrypt this tab's own epoch total and hand over the ciphertext.
-      // Buyers are positive (spent), the seller negative (received), so an
-      // honest set sums to zero.
+      // Encrypt this tab's own epoch total. Buyers are positive (spent),
+      // the seller negative (received), so an honest set sums to zero.
       const sign = myRole()==='seller' ? -1 : 1;
-      const ct=FHE.S.encrypt(epochKey, new Array(BATCH).fill(sign*myNet/SPAN));
+      const ct=epochSession().encrypt(epochKey, new Array(BATCH).fill(sign*myNet/SPAN));
       send({type:'epochtotal', blob:b64(ct)});
-      status('EPOCH TOTAL SEALED, YOUR FIGURE STAYS SEALED');
+      status('EPOCH TOTAL SEALED, NOBODY CAN OPEN IT ALONE');
       return;
     }
 
     if(m.type==='epochsum'){
       // Blind peer: add the ciphertexts. It never learns a single total,
-      // its own excepted, and never learns the sum either.
+      // its own excepted, and cannot open the sum either.
       let acc=unb64(m.blobs[0]);
-      for(let i=1;i<m.blobs.length;i++) acc=FHE.S.evalAdd(acc,unb64(m.blobs[i]));
+      for(let i=1;i<m.blobs.length;i++) acc=epochSession().evalAdd(acc,unb64(m.blobs[i]));
       send({type:'epochsummed', blob:b64(acc)});
       status('EPOCH TOTALS SUMMED UNDER ENCRYPTION');
       return;
     }
 
-    if(m.type==='epochopen'){
-      // Seller opens ONLY the sum. No participant total is decrypted, and
-      // no settled trade is reopened.
-      const net=FHE.S.fuse([FHE.S.partialDecrypt(unb64(m.blob))],1)[0]*SPAN;
+    // Every tab contributes one decryption share of the sum. A single
+    // share opens nothing.
+    if(m.type==='epochdecrypt'){
+      send({type:'epochpartial', blob:b64(epochSession().partialDecrypt(unb64(m.blob)))});
+      status('CONTRIBUTED YOUR DECRYPTION SHARE');
+      return;
+    }
+
+    // All shares in. Every tab fuses and checks the books for itself
+    // rather than taking one party's word for the result.
+    if(m.type==='epochfuse'){
+      const net=epochSession().fuse(m.blobs.map(unb64),1)[0]*SPAN;
       const ok=Math.abs(net)<0.05;
-      send({type:'epochresult', price_ct:net, ok});
-      status(ok?'BOOKS BALANCE, AGGREGATE OPENED, NO TRADE REPLAYED'
-               :`IMBALANCE ${net.toFixed(2)} CT, SOMEONE MISREPORTED`);
+      if(myRole()==='seller') send({type:'epochresult', price_ct:net, ok});
+      status(ok?'YOU VERIFIED: BOOKS BALANCE. NO TOTAL, NO TRADE REOPENED'
+               :`YOU VERIFIED: IMBALANCE ${net.toFixed(2)} CT`);
       return;
     }
 
@@ -312,10 +341,11 @@ async function sellerStart(){
 }
 
 async function epochStart(){
-  status('OPENING EPOCH AUDIT …');
-  await new Promise(r=>setTimeout(r,30));
-  const {pk}=FHE.S.singleKeyGen();
-  send({type:'epochopen', blob:b64(pk)});
+  // The seller does not mint the epoch key. It asks the relay to walk an
+  // N-of-N chain through every tab, so the key it will later help open
+  // belongs to nobody in particular.
+  status('BUILDING N-OF-N EPOCH KEY ACROSS ALL TABS …');
+  send({type:'epochstart'});
 }
 
 async function sealBid(){
@@ -404,7 +434,7 @@ function renderInner(){
     // Enough trades have settled to audit the books in aggregate.
     if(st.epoch==='ready') key('CLEAR EPOCH', epochStart, 'go');
     if(st.epoch==='done')  key('NEW EPOCH', ()=>{ myNet=0; myWins=[];
-        send({type:'newepoch'}); });
+        epochS=null; epochKey=null; send({type:'newepoch'}); });
   }else if(role==='buyer'){
     if(phase==='bidding'){
       key('BID −',()=>{myBid=Math.max(0.25,+(myBid-0.25).toFixed(2));render();});
@@ -420,7 +450,11 @@ function renderInner(){
     ? (st.epoch_ok
         ? `EPOCH AUDITED · BOOKS BALANCE · NET ${st.epoch_net.toFixed(2)} CT`
         : `EPOCH AUDITED · IMBALANCE ${st.epoch_net.toFixed(2)} CT`)
-    : ep==='audit' ? `EPOCH AUDIT · ${st.epoch_have} OF ${(st.peers||[]).length} TOTALS SEALED`
+    : ep==='audit' ? (st.epoch_chain < (st.peers||[]).length
+        ? `EPOCH AUDIT · BUILDING N-OF-N KEY · ${st.epoch_chain} OF ${(st.peers||[]).length} SHARES`
+        : st.epoch_parts>0
+          ? `EPOCH AUDIT · ${st.epoch_parts} OF ${(st.peers||[]).length} DECRYPTION SHARES`
+          : `EPOCH AUDIT · ${st.epoch_have} OF ${(st.peers||[]).length} TOTALS SEALED`)
     : `SETTLED TRADES · ${done} OF ${st.epoch_size}`;
 
   // trade log

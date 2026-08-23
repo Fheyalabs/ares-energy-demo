@@ -204,8 +204,22 @@ func (h *hub) handle(id string, m msg) {
 	// ciphertexts; the seller opens the sum and nothing else. No
 	// individual total, and no individual trade, is ever reopened.
 
-	case "epochopen":
-		h.auction.OpenEpochAudit([]byte(m.Blob))
+	// The epoch key is generated N-of-N across every tab, so no single
+	// party can open a total under it, the seller included. The relay
+	// walks the chain one peer at a time.
+	case "epochstart":
+		if first := h.auction.StartEpochChain(); first != "" {
+			h.send(first, msg{Type: "epochchain", Blob: ""})
+		}
+		h.broadcast()
+
+	case "epochchained":
+		next, done := h.auction.AdvanceEpochChain([]byte(m.Blob))
+		if !done {
+			h.send(next, msg{Type: "epochchain", Blob: m.Blob})
+			h.broadcast()
+			return
+		}
 		h.broadcast()
 		for _, pid := range h.peerIDs() {
 			h.send(pid, msg{Type: "epochkey", Blob: m.Blob})
@@ -226,12 +240,30 @@ func (h *hub) handle(id string, m msg) {
 		}
 		h.broadcast()
 
-	// The blind peer returns the summed ciphertext; only the seller can
-	// open it.
+	// The blind peer returns the summed ciphertext. Nobody can open it
+	// alone: every tab contributes a decryption share.
 	case "epochsummed":
-		if sid := h.auction.SellerID(); sid != "" {
-			h.send(sid, msg{Type: "epochopen", Blob: m.Blob})
+		for _, pid := range h.peerIDs() {
+			h.send(pid, msg{Type: "epochdecrypt", Blob: m.Blob})
 		}
+
+	case "epochpartial":
+		if !h.auction.SubmitEpochPartial(id, []byte(m.Blob)) {
+			h.broadcast()
+			return
+		}
+		// Every share is in. Hand the whole set to every tab so each one
+		// fuses and checks the books for itself, rather than taking one
+		// party's word for the result.
+		parts := h.auction.EpochPartials()
+		blobs := make([]string, len(parts))
+		for i, ct := range parts {
+			blobs[i] = string(ct)
+		}
+		for _, pid := range h.peerIDs() {
+			h.send(pid, msg{Type: "epochfuse", Blobs: blobs})
+		}
+		h.broadcast()
 
 	case "epochresult":
 		h.auction.CloseEpoch(m.Price, m.Ok)
